@@ -19,6 +19,7 @@ import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { PATH_RULES_PROOF_FIELD, PathRuleActivationError, PathRulesGate, pathRulesApplyToTool } from "./pathRules.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -78,10 +79,16 @@ function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeo
 }
 
 function errorResult(error: unknown): any {
+  const text = errorText(error);
+  const structuredContent: Record<string, unknown> = { error: text };
+  if (error instanceof PathRuleActivationError) {
+    structuredContent.path_rules_required_proof = error.requiredProof;
+    structuredContent.path_rules_proof_field = PATH_RULES_PROOF_FIELD;
+  }
   return {
     isError: true,
-    content: [{ type: "text", text: errorText(error) }],
-    structuredContent: { error: errorText(error) }
+    content: [{ type: "text", text }],
+    structuredContent
   };
 }
 
@@ -157,6 +164,21 @@ function descriptorOptionsForConfig(config: CodexProConfig, name: string, option
   return { ...options, _meta: meta };
 }
 
+function optionsWithPathRulesProof(name: string, options: Record<string, unknown>): Record<string, unknown> {
+  if (!pathRulesApplyToTool(name)) return options;
+  const inputSchema = options.inputSchema;
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return options;
+  return {
+    ...options,
+    inputSchema: {
+      ...(inputSchema as Record<string, unknown>),
+      [PATH_RULES_PROOF_FIELD]: z.record(z.string()).optional().describe(
+        "Exact path-rule proof returned by a previous PATH-SCOPED RULES ACTIVATED result. Keys are rule fingerprints and values are the full canonical rule texts. Keep supplying the exact text on later calls touching those rules; do not abbreviate it or replace it with only a hash/nonce."
+      )
+    }
+  };
+}
+
 function toolCallLoggingEnabled(): boolean {
   return process.env.CODEXPRO_LOG_TOOL_CALLS === "1" || process.env.CODEXPRO_LOG_REQUESTS === "1";
 }
@@ -217,7 +239,7 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
   }
 }
 
-type CodexToolHandler = (args: any) => Promise<any> | any;
+type CodexToolHandler = (args: any, extra?: any) => Promise<any> | any;
 
 const SUPERTOOL_NAME = "codexpro";
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
@@ -276,12 +298,12 @@ function registerToolCompat(
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
-  handler: (args: any) => Promise<any> | any
+  handler: (args: any, extra?: any) => Promise<any> | any
 ): void {
-  const wrapped = async (args: any) => {
+  const wrapped = async (args: any, extra?: any) => {
     const started = Date.now();
     try {
-      const result = tagToolResult(await handler(args ?? {}), name, options);
+      const result = tagToolResult(await handler(args ?? {}, extra), name, options);
       logToolCall(name, result?.isError ? "error" : "ok", started);
       return result;
     } catch (error) {
@@ -431,6 +453,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
 const MINIMAL_TOOLS = new Set<string>(MINIMAL_TOOL_NAMES);
 const STANDARD_TOOLS = new Set<string>(STANDARD_TOOL_NAMES);
 const registeredToolNamesByServer = new WeakMap<object, string[]>();
+const pathRulesGatesByServer = new WeakMap<object, PathRulesGate>();
 
 function rememberRegisteredTool(server: McpServer, name: string): void {
   const key = server as object;
@@ -464,8 +487,18 @@ function registerCodexTool(
   handler: CodexToolHandler
 ): void {
   if (!shouldRegisterTool(config, name)) return;
-  const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
-  registerToolCompat(server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
+  const effectiveOptions = optionsWithPathRulesProof(name, options);
+  const validatedHandler: CodexToolHandler = (args, extra) => {
+    const validatedArgs = validateToolArgs(name, effectiveOptions, args);
+    pathRulesGatesByServer.get(server as object)?.beforeTool(name, validatedArgs);
+    if (pathRulesApplyToTool(name) && validatedArgs && typeof validatedArgs === "object") {
+      const handlerArgs = { ...validatedArgs };
+      delete handlerArgs[PATH_RULES_PROOF_FIELD];
+      return handler(handlerArgs, extra);
+    }
+    return handler(validatedArgs, extra);
+  };
+  registerToolCompat(server, name, descriptorOptionsForConfig(config, name, effectiveOptions), validatedHandler);
   rememberRegisteredTool(server, name);
   rememberRegisteredToolHandler(server, name, validatedHandler);
 }
@@ -488,8 +521,8 @@ function serverInstructions(config: CodexProConfig): string {
     "CodexPro connects ChatGPT to explicitly allowed local development workspaces.",
     "",
     "Preferred workflow:",
-    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; that selection stays active for this MCP session.",
-    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files.",
+    "1. Start with open_current_workspace. Use open_workspace only when the user gives a different allowed root or asks to switch projects; explicitly pass the returned workspace_id in subsequent tool calls because some HTTP connectors are stateless across tool calls.",
+    "2. Follow any AGENTS.md-style instructions returned by the workspace open call before editing files. If a tool is blocked by PATH-SCOPED RULES ACTIVATED, re-evaluate the action and, if still appropriate, retry with the exact path_rules_proof payload returned by the block. Keep attaching the exact full proof text to later calls touching those rules; never replace it with only a fingerprint or summary.",
     "3. Inspect with tree, search, and read. Do not use bash for git status, git diff, cat, sed, grep, rg, find, ls, or file reading.",
     editInstruction,
     bashInstruction,
@@ -928,10 +961,12 @@ const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, d
 
 export function createCodexProServer(config: CodexProConfig): McpServer {
   const workspaces = new WorkspaceManager(config);
+  const pathRulesGate = new PathRulesGate(workspaces);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: "0.30.0" }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
+  pathRulesGatesByServer.set(server as object, pathRulesGate);
   registerToolCardResource(server, config);
 
   registerCodexTool(
@@ -953,7 +988,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         "openai/toolInvocation/invoked": "CodexPro supertool action complete"
       }
     },
-    async (args) => {
+    async (args, extra) => {
       const action = normalizeSupertoolAction(args.action);
       const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
       if (action === "list_actions" || action === "help") {
@@ -1000,7 +1035,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
           : {};
       let result: any;
       try {
-        result = await handler(childArgs);
+        result = await handler(childArgs, extra);
       } catch (error) {
         result = errorResult(error);
       }
@@ -1061,6 +1096,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         maxOutputBytes: config.maxOutputBytes,
         maxSearchResults: config.maxSearchResults,
         blockedGlobs: config.blockedGlobs,
+        pathRules: pathRulesGate.status(),
         registeredTools: registeredToolNames(server),
         registeredToolCount: registeredToolNames(server).length
       };

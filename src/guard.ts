@@ -58,6 +58,8 @@ function closestExistingParent(absPath: string): string {
   return current;
 }
 
+const sharedWorkspaces = new Map<string, Workspace>();
+
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
   private selectedWorkspaceId?: string;
@@ -65,8 +67,13 @@ export class WorkspaceManager {
   constructor(private readonly config: CodexProConfig) {}
 
   defaultWorkspace(): Workspace {
-    const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot);
-    return existing ?? this.openWorkspace(this.config.defaultRoot, { select: false });
+    const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot)
+      ?? [...sharedWorkspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot && this.config.allowedRoots.some((allowedRoot) => isSubpath(workspace.root, allowedRoot)));
+    if (existing) {
+      this.workspaces.set(existing.id, existing);
+      return existing;
+    }
+    return this.openWorkspace(this.config.defaultRoot, { select: false });
   }
 
   selectDefaultWorkspace(): Workspace {
@@ -93,15 +100,18 @@ export class WorkspaceManager {
       );
     }
 
-    const existing = [...this.workspaces.values()].find((workspace) => workspace.root === realRoot);
+    const id = workspaceIdForRoot(realRoot);
+    const existing = this.workspaces.get(id) ?? sharedWorkspaces.get(id);
     if (existing) {
+      this.workspaces.set(id, existing);
+      sharedWorkspaces.set(id, existing);
       if (options.select !== false) this.selectedWorkspaceId = existing.id;
       return existing;
     }
 
-    const id = workspaceIdForRoot(realRoot);
     const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
     this.workspaces.set(id, workspace);
+    sharedWorkspaces.set(id, workspace);
     if (options.select !== false) this.selectedWorkspaceId = id;
     return workspace;
   }
@@ -114,7 +124,14 @@ export class WorkspaceManager {
       }
       return this.selectDefaultWorkspace();
     }
-    const workspace = this.workspaces.get(id);
+    let workspace = this.workspaces.get(id);
+    if (!workspace) {
+      const shared = sharedWorkspaces.get(id);
+      if (shared && this.config.allowedRoots.some((allowedRoot) => isSubpath(shared.root, allowedRoot))) {
+        this.workspaces.set(id, shared);
+        workspace = shared;
+      }
+    }
     if (!workspace) {
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
       if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
@@ -126,7 +143,20 @@ export class WorkspaceManager {
   }
 
   listWorkspaces(): Workspace[] {
-    return [...this.workspaces.values()];
+    const combined = new Map<string, Workspace>();
+    for (const workspace of this.workspaces.values()) {
+      if (this.config.allowedRoots.some((allowedRoot) => isSubpath(workspace.root, allowedRoot))) {
+        combined.set(workspace.id, workspace);
+      }
+    }
+    for (const workspace of sharedWorkspaces.values()) {
+      if (this.config.allowedRoots.some((allowedRoot) => isSubpath(workspace.root, allowedRoot))) {
+        if (!combined.has(workspace.id)) {
+          combined.set(workspace.id, workspace);
+        }
+      }
+    }
+    return [...combined.values()];
   }
 
   currentWorkspaceId(): string {
