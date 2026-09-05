@@ -19,6 +19,7 @@ import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { exportChatGPTChats } from "./chatgptExportOps.js";
 import { PATH_RULES_PROOF_FIELD, PathRuleActivationError, PathRulesGate, pathRulesApplyToTool } from "./pathRules.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -357,6 +358,7 @@ const STANDARD_TOOL_NAMES = [
   "inspect_workspace",
   "tree",
   "search",
+  "export_chatgpt_chats",
   "load_skill",
   "view_image",
   "read_handoff",
@@ -378,6 +380,7 @@ const FULL_TOOL_NAMES = [
   "inspect_workspace",
   "tree",
   "search",
+  "export_chatgpt_chats",
   "read",
   "view_image",
   "write",
@@ -404,6 +407,7 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "bash",
+  "export_chatgpt_chats",
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex"
@@ -527,6 +531,7 @@ function serverInstructions(config: CodexProConfig): string {
     editInstruction,
     bashInstruction,
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
+    "When the user supplies one or more private https://chatgpt.com/c/... conversation links as context to inspect, compare, recover, or continue prior work, use export_chatgpt_chats to materialize the canonical Markdown first instead of trying to scrape the web page.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -956,6 +961,7 @@ async function writeAgentHandoff(
 const READ_ONLY_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false };
 const SESSION_READ_ANNOTATIONS = { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 const LOCAL_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false };
+const CHATGPT_EXPORT_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: false, idempotentHint: false };
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
@@ -1101,6 +1107,46 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         registeredToolCount: registeredToolNames(server).length
       };
       return textResult(`# CodexPro Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "export_chatgpt_chats",
+    {
+      title: "Export ChatGPT Chats",
+      description:
+        "Export one or more private ChatGPT conversation URLs/IDs to canonical local Markdown through chatgpt-exporter/CWA. Use this when the user provides ChatGPT chat links as context; it preserves visible alternative branches and returns absolute local file paths.",
+      inputSchema: {
+        chats: z.array(z.string().min(1)).min(1).max(20).describe("Private https://chatgpt.com/c/<id> URLs or conversation UUIDs to export.")
+      },
+      annotations: CHATGPT_EXPORT_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Exporting ChatGPT conversations...",
+        "openai/toolInvocation/invoked": "ChatGPT conversation export complete"
+      }
+    },
+    async (args) => {
+      const result = await exportChatGPTChats({
+        chats: args.chats
+      });
+      const paths = result.results
+        .filter((item) => item.ok === true && typeof item.path === "string")
+        .map((item) => String(item.path));
+      const failures = result.results
+        .filter((item) => item.ok !== true)
+        .map((item) => String(item.error ?? item.chat ?? "unknown export failure"));
+      const text = [
+        `Exported ${result.exported}/${result.count} ChatGPT conversation${result.count === 1 ? "" : "s"} to Markdown.`,
+        paths.length ? `Files:\n${paths.map((file) => `- ${file}`).join("\n")}` : "No Markdown files were exported.",
+        failures.length ? `Failures:\n${failures.map((failure) => `- ${failure}`).join("\n")}` : ""
+      ].filter(Boolean).join("\n\n");
+      return textResult(text, {
+        ...result,
+        paths
+      });
     }
   );
 

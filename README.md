@@ -70,6 +70,13 @@ With workspace write mode (the normal agent setup):
 - review diffs with `show_changes`
 - write plans under `.ai-bridge`
 - export a context bundle for chats that cannot call tools
+- export private ChatGPT conversation URLs to local Markdown with `export_chatgpt_chats`
+
+### Private ChatGPT conversation links
+
+`export_chatgpt_chats` is an optional local integration. It expects the companion `chatgpt-exporter` CLI in `PATH`; CodexPro does not duplicate ChatGPT session or Markdown logic. The tool accepts one or more private `https://chatgpt.com/c/<id>` links (or conversation UUIDs), exports them through CWA, and returns absolute Markdown paths under `~/Documents/chatgpt-exports/`.
+
+The companion exporter owns ChatGPT archive/index behavior and CWA owns browser/session canonical reads. CodexPro only invokes the installed CLI without a shell. If the exporter is not installed, the tool fails explicitly instead of falling back to web-page scraping.
 
 ## Multiple projects
 
