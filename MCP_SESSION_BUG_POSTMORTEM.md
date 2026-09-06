@@ -134,3 +134,48 @@ The aggressive `onclose` handler was removed. Session destruction is now strictl
 ### C. macOS Wi-Fi Geolocation Jumps (Electronic Warfare / РЭБ)
 * **Cause:** MacBooks lack a hardware GPS receiver and rely on Apple Location Services (`locationd`) using Wi-Fi BSSID triangulation. In active electronic warfare zones, GPS spoofing tricks smartphones (iPhones on the same Wi-Fi), which upload spoofed coordinates to Apple's cloud BSSID database. Additionally, Xiaomi routers broadcast `802.11d Country Code: CN`.
 * **Fix:** Disable macOS Location Services in System Settings (`Privacy & Security -> Location Services -> Off`) to force applications to fall back to ISP IP-based geolocation (e.g., Vega Telecom GPON accurately resolving to Dnipro, UA), or append `_nomap` to the router SSID.
+
+---
+
+## 7. Incident: Tailscale Funnel DERP Idle Disconnects (75s) & Keepalive Solution
+
+**Date:** 2026-09-06  
+**Component:** `scripts/codexpro.mjs` (CodexPro CLI Runner)  
+**Commit:** `b7709d8` (`fix(tunnel): add active tunnel keepalive to prevent DERP idle disconnects and TLS EOF`)  
+**Branch:** `path-rules`
+
+### The Problem
+
+Even with the transport session fix (`1acb9eb`), remote AI agents in ChatGPT Web continued to experience intermittent `Connection failed` errors. Specifically:
+* Commands executed in rapid succession succeeded without issue.
+* As soon as the agent paused for >1–2 minutes (thinking, generating a long response, or waiting for user input), the very next tool call failed with `Connection failed`.
+* Inspection of the local terminal showed no errors, but unified system logs (`io.tailscale.ipn.macsys.network-extension`) revealed:
+  ```text
+  magicsock: closing connection to derp-4 (idle), age 1m15s
+  ...
+  http: TLS handshake error from [fd7a:115c:a1e0::f701:f79c]:33814: EOF
+  magicsock: adding connection to derp-4 for [ZzXTg]
+  magicsock: derp-4 connected; connGen=1
+  ```
+
+### Root Cause Analysis
+
+1. **NAT Traversal Constraints:** `tailscale netcheck` reported `PortMapping: none` (UPnP/NAT-PMP disabled on local router). Consequently, direct WireGuard UDP peer-to-peer connections to Tailscale Funnel edge ingress nodes could not be established; all ingress traffic had to flow through the nearest DERP relay (`derp-4` in Frankfurt).
+2. **Aggressive DERP Idle Reaper:** Tailscale client daemon implements an idle connection reaper that closes connections to DERP relays after exactly 75 seconds (`1m15s`) of inactivity (`magicsock: closing connection to derp-4 (idle)`).
+3. **TLS Handshake Race on Reconnection:** When an external request hits the Funnel edge ingress while DERP-4 is closed, the edge proxy initiates a connection. The local daemon detects the packet and opens a new connection to `derp-4` (~150–300ms). However, the remote client (or edge proxy) TLS handshake deadline expires first, resulting in `TLS handshake error: EOF` and an immediate `Connection failed` in ChatGPT Web.
+4. **Aggravating Factors:** Two orphaned background processes were pinning 2 CPU cores at 100% on a machine running in macOS Low Power Mode (`lowpowermode 1`), delaying DERP reconnection routines.
+
+### The Fix
+
+1. **Native Tunnel Keepalive:** In `scripts/codexpro.mjs`, implemented `startTunnelKeepAlive(url, token, verbose, 20000)`. When any public tunnel (`tailscale`, `cloudflare`, `ngrok`) is started, a background heartbeat probe is dispatched every 20 seconds to `${publicBase}/healthz` with the auth token.
+   * **Why 20s:** It sits well below the 75s DERP idle timeout and standard NAT router connection tracking timeouts, preventing DERP-4 from ever transitioning to an idle state.
+   * **Non-blocking:** Probes run with an unref-ed timer and AbortController timeout (8s), with concurrent execution locks (`inFlight`) to avoid queue pileup.
+   * **Clean Teardown:** Hooked into the CLI `cleanup()` sequence (`stopTunnelKeepAlive()`) so that process termination remains clean.
+2. **Official macOS Tailscale Binary Preference:** Updated `resolveTailscale` to check `/Applications/Tailscale.app/Contents/MacOS/Tailscale` on macOS before falling back to PATH, preventing CLI/daemon version mismatch warnings (`teb67e5dcb` vs `t6cac91817`).
+3. **Process Hygiene:** Terminated orphaned runaway processes and verified normal system load.
+
+### Verification
+
+* **Controlled Idle Test:** Without keepalive, DERP-4 reliably closed at 75s of silence (`age 1m15s`), followed by TLS handshake errors.
+* **Keepalive Stress Test:** Ran a 3-minute keepalive series with 20s intervals over the public endpoint `https://macbook-pro-stas.tail64004b.ts.net/healthz`. 100% of probes succeeded with 0.33–0.50s latency, with zero DERP disconnects and zero TLS handshake errors in system logs.
+* **Smoke Suite:** Verified `npm run path-rules:verify` passed all 12 smoke test suites.
