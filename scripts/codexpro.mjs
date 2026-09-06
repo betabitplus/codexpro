@@ -556,11 +556,7 @@ function optionalWriteOption(args, profile, mode) {
 }
 
 function commandExists(command) {
-  const result = spawnSync(process.platform === 'win32' ? 'where' : 'command', process.platform === 'win32' ? [command] : ['-v', command], {
-    shell: process.platform !== 'win32',
-    stdio: 'ignore'
-  });
-  return result.status === 0;
+  return commandPaths(command).length > 0;
 }
 
 function commandPaths(command) {
@@ -1446,8 +1442,8 @@ function waitForProcessExit(child) {
   });
 }
 
-async function waitForPublicHealth(publicBase, token, tunnelChild, tunnelLabel = 'tunnel') {
-  const health = waitForHealth(`${publicBase}/healthz`, token, 60000);
+async function waitForPublicHealth(publicBase, token, tunnelChild, tunnelLabel = 'tunnel', timeoutMs = 60000) {
+  const health = waitForHealth(`${publicBase}/healthz`, token, timeoutMs);
   if (!tunnelChild) return health;
   const exit = waitForProcessExit(tunnelChild).then(({ code, signal }) => {
     throw new Error(`${tunnelLabel} exited before ${publicBase}/healthz was reachable, code=${code} signal=${signal}`);
@@ -3783,7 +3779,7 @@ async function runSettings(argv) {
 }
 
 function writeControlPrompt() {
-  process.stdout.write('codexpro> ');
+  process.stdout.write('[server running] codexpro> ');
 }
 
 function runControlPanel(details, cleanup = cleanupChildren) {
@@ -4209,32 +4205,44 @@ async function main() {
     const publicBase = publicBaseFromHostname(stableHostname);
     const httpsPort = tailscaleFunnelHttpsPort(publicBase);
     const alreadyServing = isTailscaleFunnelActive(tailscalePath, port);
+    let healthy = false;
     if (alreadyServing) {
-      statusLine('ok', `Tailscale Funnel already active for ${publicBase}`);
-    } else {
+      statusLine('wait', `Checking existing Tailscale Funnel for ${publicBase}`);
+      try {
+        await waitForPublicHealth(publicBase, token, null, 'Tailscale Funnel', 5000);
+        healthy = true;
+        statusLine('ok', `Tailscale Funnel active and reachable at ${publicBase}`);
+      } catch {
+        statusLine('warn', `Existing Tailscale Funnel was unresponsive. Resetting and reopening for ${publicBase}...`);
+        try {
+          spawnSyncPortable(tailscalePath, ['funnel', 'reset'], { stdio: 'ignore', timeout: 5000 });
+        } catch {}
+      }
+    }
+    if (!healthy) {
       const tailscaleArgs = ['funnel'];
       if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
       tailscaleArgs.push(localBase);
       statusLine('wait', `Opening Tailscale Funnel for ${publicBase}`);
       cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+      try {
+        await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
+      } catch (error) {
+        const tail = typeof cloudflared?.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
+        const hint = [
+          '',
+          'Tailscale Funnel needs one-time setup before this can succeed:',
+          '',
+          '  install and log in to Tailscale',
+          '  enable MagicDNS, HTTPS certificates, and Funnel for this tailnet',
+          '  codexpro tailscale --hostname your-device.your-tailnet.ts.net --token keep-this-stable-token',
+          '',
+          'Funnel exposes this connector publicly. Keep the CodexPro token enabled.'
+        ].join('\n');
+        throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
+      }
     }
-    try {
-      await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
-      stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
-    } catch (error) {
-      const tail = typeof cloudflared.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
-      const hint = [
-        '',
-        'Tailscale Funnel needs one-time setup before this can succeed:',
-        '',
-        '  install and log in to Tailscale',
-        '  enable MagicDNS, HTTPS certificates, and Funnel for this tailnet',
-        '  codexpro tailscale --hostname your-device.your-tailnet.ts.net --token keep-this-stable-token',
-        '',
-        'Funnel exposes this connector publicly. Keep the CodexPro token enabled.'
-      ].join('\n');
-      throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
-    }
+    stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,

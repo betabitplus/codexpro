@@ -179,3 +179,53 @@ Even with the transport session fix (`1acb9eb`), remote AI agents in ChatGPT Web
 * **Controlled Idle Test:** Without keepalive, DERP-4 reliably closed at 75s of silence (`age 1m15s`), followed by TLS handshake errors.
 * **Keepalive Stress Test:** Ran a 3-minute keepalive series with 20s intervals over the public endpoint `https://macbook-pro-stas.tail64004b.ts.net/healthz`. 100% of probes succeeded with 0.33–0.50s latency, with zero DERP disconnects and zero TLS handshake errors in system logs.
 * **Smoke Suite:** Verified `npm run path-rules:verify` passed all 12 smoke test suites.
+
+
+---
+
+## 8. Stale Edge Ingress Desynchronization (`SSL_ERROR_SYSCALL`) & CLI Self-Healing
+
+### Symptoms Observed
+
+* User restarted `codexpro start` and observed:
+  ```text
+  OK Local MCP ready at http://127.0.0.1:8787/mcp
+  OK Tailscale Funnel already active for https://macbook-pro-stas.tail64004b.ts.net
+  CodexPro ready
+  [server running] codexpro>
+  ```
+* But remote calls to `https://macbook-pro-stas.tail64004b.ts.net` failed immediately:
+  ```text
+  * LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to macbook-pro-stas.tail64004b.ts.net:443
+  curl: (35) LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to macbook-pro-stas.tail64004b.ts.net:443
+  ```
+* Additionally, the interactive prompt `codexpro>` was mistaken for a stalled process or input prompt, and Node.js logged a deprecation warning `[DEP0190] Passing args to a shell is deprecated`.
+
+### Root Cause Analysis
+
+1. **Coordination Server Edge Ingress Desync:**
+   Repeated restarts and background serve state cached in the macOS Keychain (`tailscale-serve/c060`) caused the local `tailscaled` daemon to believe Funnel was active (`AllowFunnel: true`). However, the Tailscale coordination server sent `Hostinfo.IngressEnabled: false` / `invalid-packet-filter` to the edge ingress proxies (`185.40.234.x`). When external clients connected to the edge proxies on port 443, the edge proxies immediately reset the connection on Client Hello (`SSL_ERROR_SYSCALL`).
+2. **Missing Self-Healing in CLI:**
+   When `isTailscaleFunnelActive()` detected a pre-existing funnel config, it simply assumed the funnel was healthy. If the funnel was broken or desynchronized, it hung during startup health checks or failed without attempting to reset.
+3. **DEP0190 Deprecation Warning:**
+   In Node 22+, `commandExists()` called `spawnSync(..., { shell: true })` with args, triggering `[DEP0190]`.
+4. **Prompt Ambiguity:**
+   The interactive control panel prompt `codexpro>` did not explicitly state that the server was actively running in the background.
+
+### The Fix
+
+1. **Edge Resynchronization & Self-Healing:**
+   * Executed `tailscale funnel reset` followed by `tailscale funnel --bg 8787` to force full coordination server re-registration.
+   * In `scripts/codexpro.mjs`, when `alreadyServing` is detected, the CLI performs a fast 5s probe against `${publicBase}/healthz`. If unresponsive, it automatically logs a warning, resets the funnel (`tailscale funnel reset`), and re-provisions a fresh funnel.
+2. **Safe Log Tail Reference:**
+   * Replaced `cloudflared.codexproLogTail` with optional chaining `cloudflared?.codexproLogTail` to prevent `TypeError` if `cloudflared` process handle is undefined.
+3. **Eliminated DEP0190:**
+   * Updated `commandExists()` to use `commandPaths(command).length > 0` which avoids passing arguments to a shell.
+4. **Clarified Server State in UI:**
+   * Changed interactive prompt from `codexpro> ` to `[server running] codexpro> ` and added clear status banner indicating that the server is live in background and no keyboard input is required.
+
+### Verification
+
+* `curl -v -H "Authorization: Bearer $(cat ~/.codexpro/http-token)" https://macbook-pro-stas.tail64004b.ts.net/healthz` -> `HTTP/2 200 OK`.
+* Full MCP initialization POST over public Funnel returned `HTTP/2 200` with JSON-RPC initialize response and session ID.
+* Verified no `[DEP0190]` warnings and clean `npm run doctor` output.
