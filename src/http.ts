@@ -1691,13 +1691,11 @@ async function main(): Promise<void> {
               lastSeenAt: Date.now()
             });
             pruneTransports();
+          },
+          onsessionclosed: (closedSessionId: string) => {
+            if (closedSessionId) transports.delete(closedSessionId);
           }
         } as any);
-
-        (transport as any).onclose = () => {
-          const closedSessionId = (transport as any).sessionId;
-          if (closedSessionId) transports.delete(closedSessionId);
-        };
 
         const server = createCodexProServer(config);
         await server.connect(transport);
