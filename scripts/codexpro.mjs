@@ -1059,7 +1059,13 @@ async function waitForHealth(url, token, timeoutMs = 15000) {
   let lastError = '';
   while (Date.now() - started < timeoutMs) {
     try {
-      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: controller.signal
+      });
+      clearTimeout(timer);
       if (res.ok) return await res.json();
       lastError = `${res.status} ${await res.text()}`;
     } catch (error) {
@@ -1068,6 +1074,38 @@ async function waitForHealth(url, token, timeoutMs = 15000) {
     await sleep(250);
   }
   throw new Error(`Timed out waiting for ${url}. Last error: ${lastError}`);
+}
+
+function isTailscaleFunnelActive(tailscalePath, targetPort = 8787) {
+  try {
+    const res = spawnSyncPortable(tailscalePath, ['serve', 'status', '--json'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000
+    });
+    if (res.status === 0 && res.stdout) {
+      const parsed = JSON.parse(res.stdout.toString('utf8'));
+      const portStr = String(targetPort);
+      const checkConfig = (cfg) => {
+        if (!cfg) return false;
+        const funnel = cfg.AllowFunnel;
+        const web = cfg.Web;
+        if (!funnel || typeof funnel !== 'object') return false;
+        const hasFunnel = Object.values(funnel).some(Boolean);
+        if (!hasFunnel) return false;
+        if (web && typeof web === 'object') {
+          return JSON.stringify(web).includes(portStr);
+        }
+        return true;
+      };
+      if (checkConfig(parsed)) return true;
+      if (parsed.Foreground && typeof parsed.Foreground === 'object') {
+        for (const session of Object.values(parsed.Foreground)) {
+          if (checkConfig(session)) return true;
+        }
+      }
+    }
+  } catch {}
+  return false;
 }
 
 function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000) {
@@ -1410,6 +1448,7 @@ function waitForProcessExit(child) {
 
 async function waitForPublicHealth(publicBase, token, tunnelChild, tunnelLabel = 'tunnel') {
   const health = waitForHealth(`${publicBase}/healthz`, token, 60000);
+  if (!tunnelChild) return health;
   const exit = waitForProcessExit(tunnelChild).then(({ code, signal }) => {
     throw new Error(`${tunnelLabel} exited before ${publicBase}/healthz was reachable, code=${code} signal=${signal}`);
   });
@@ -4169,11 +4208,16 @@ async function main() {
     const tailscalePath = resolveTailscale(effectiveArgs);
     const publicBase = publicBaseFromHostname(stableHostname);
     const httpsPort = tailscaleFunnelHttpsPort(publicBase);
-    const tailscaleArgs = ['funnel'];
-    if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
-    tailscaleArgs.push(localBase);
-    statusLine('wait', `Opening Tailscale Funnel for ${publicBase}`);
-    cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+    const alreadyServing = isTailscaleFunnelActive(tailscalePath, port);
+    if (alreadyServing) {
+      statusLine('ok', `Tailscale Funnel already active for ${publicBase}`);
+    } else {
+      const tailscaleArgs = ['funnel'];
+      if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
+      tailscaleArgs.push(localBase);
+      statusLine('wait', `Opening Tailscale Funnel for ${publicBase}`);
+      cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+    }
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
       stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
