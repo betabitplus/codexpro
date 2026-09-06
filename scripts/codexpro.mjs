@@ -569,7 +569,7 @@ function commandPaths(command) {
     if (result.status !== 0) return [];
     return String(result.stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   }
-  const result = spawnSync('command', ['-v', command], { encoding: 'utf8', shell: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  const result = spawnSync('/bin/sh', ['-c', 'command -v "$1"', '_', command], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   if (result.status !== 0) return [];
   return String(result.stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
