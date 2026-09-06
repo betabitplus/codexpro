@@ -1016,6 +1016,16 @@ function resolveTailscale(args) {
     throw new Error(`tailscale was not found at ${explicit}. Install Tailscale, add it to PATH, or pass --tailscale <path>.`);
   }
 
+  if (process.platform === 'darwin') {
+    const appTailscale = '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
+    if (fs.existsSync(appTailscale) && commandAvailable(appTailscale)) {
+      try {
+        verifyTailscale(appTailscale);
+        return appTailscale;
+      } catch {}
+    }
+  }
+
   if (commandExists('tailscale')) {
     verifyTailscale('tailscale');
     return 'tailscale';
@@ -1058,6 +1068,44 @@ async function waitForHealth(url, token, timeoutMs = 15000) {
     await sleep(250);
   }
   throw new Error(`Timed out waiting for ${url}. Last error: ${lastError}`);
+}
+
+function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000) {
+  let active = true;
+  let inFlight = false;
+  const ping = async () => {
+    if (!active || inFlight) return;
+    inFlight = true;
+    const start = Date.now();
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      const elapsed = Date.now() - start;
+      if (!res.ok && verbose) {
+        console.warn(`[tunnel-keepalive] Warning: probe returned status ${res.status} in ${elapsed}ms`);
+      } else if (elapsed > 3500 && verbose) {
+        console.warn(`[tunnel-keepalive] High latency: ${elapsed}ms`);
+      }
+    } catch (err) {
+      if (active && verbose) {
+        console.warn(`[tunnel-keepalive] Probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const timer = setInterval(ping, intervalMs);
+  timer.unref();
+  return () => {
+    active = false;
+    clearInterval(timer);
+  };
 }
 
 function portInUseHelp(host, port) {
@@ -4016,7 +4064,9 @@ async function main() {
   const server = spawnLogged('codexpro', process.execPath, [httpPath], { cwd: projectRoot, env: serverEnv, verbose: verboseLogs });
   let cloudflared;
   let cleanupTunnelCredentials = () => {};
+  let stopTunnelKeepAlive = () => {};
   const cleanup = () => {
+    stopTunnelKeepAlive();
     cleanupTunnelCredentials();
     cleanupChildren();
     clearRuntimeConnection(root);
@@ -4079,6 +4129,7 @@ async function main() {
     cloudflared = spawnLogged('ngrok', ngrokPath, ngrokArgs, { cwd: root, env: process.env, verbose: verboseLogs });
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'ngrok');
+      stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
     } catch (error) {
       const tail = typeof cloudflared.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
       const hint = [
@@ -4125,6 +4176,7 @@ async function main() {
     cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
     try {
       await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
+      stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
     } catch (error) {
       const tail = typeof cloudflared.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
       const hint = [
@@ -4209,6 +4261,7 @@ async function main() {
       cloudflared = spawnLogged('cloudflared', cloudflaredPath, ['tunnel', '--url', localBase], { cwd: root, env: process.env, verbose: verboseLogs });
       publicBase = await waitForCloudflareUrl(cloudflared);
     }
+    stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,
@@ -4261,6 +4314,7 @@ async function main() {
   cloudflared = spawnLogged('cloudflared', cloudflaredPath, cloudflaredArgs, { cwd: root, env: cloudflaredEnv, verbose: verboseLogs });
   try {
     await waitForPublicHealth(publicBase, token, cloudflared);
+    stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
   } catch (error) {
     const tail = typeof cloudflared.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
     const hint = [
