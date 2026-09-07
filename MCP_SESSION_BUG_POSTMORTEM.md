@@ -229,3 +229,60 @@ Even with the transport session fix (`1acb9eb`), remote AI agents in ChatGPT Web
 * `curl -v -H "Authorization: Bearer $(cat ~/.codexpro/http-token)" https://macbook-pro-stas.tail64004b.ts.net/healthz` -> `HTTP/2 200 OK`.
 * Full MCP initialization POST over public Funnel returned `HTTP/2 200` with JSON-RPC initialize response and session ID.
 * Verified no `[DEP0190]` warnings and clean `npm run doctor` output.
+
+
+---
+
+## 9. Foreground Funnel Zombie Session & Auto-Healing Background Watchdog
+
+### Symptoms Observed
+
+* After running for several hours, ChatGPT agent suddenly reported:
+  `Connection failed / tool disconnecting` ("инструмент отваливается").
+* In Tailscale system logs (`io.tailscale.ipn.macsys.network-extension`):
+  ```text
+  Drop: TCP{[fd7a:115c:a1e0::f701:f79c]:48725 > [fd7a:115c:a1e0::cf01:d2c4]:37393} 80 no rules matched
+  http: TLS handshake error from [fd7a:115c:a1e0::f701:f79c]:35630: EOF
+  ```
+* Running `tailscale funnel status` showed:
+  ```text
+  # Funnel on:
+  No serve config
+  ```
+* But checking processes showed the child process `tailscale funnel http://127.0.0.1:8787` still hanging as a zombie (PID 66223).
+* Attempting to run `tailscale funnel --bg 8787` failed with:
+  ```text
+  sending serve config: updating config: foreground listener already exists for port 443
+  ```
+
+### Root Cause Analysis
+
+1. **Transient Foreground Funnel Vulnerability:**
+   When `codexpro` spawned `tailscale funnel <target>` without `--bg`, Tailscale created a transient foreground session tied to an ephemeral local port (e.g. `37393`) and IPC connection.
+2. **Sleep / Network Change Invalidation:**
+   When macOS went to sleep or the local IP address changed (`192.168.31.223` -> `192.168.31.151`), the Tailscale daemon invalidated the transient foreground serve session (`No serve config`). However, the spawned child process did NOT terminate, retaining a "foreground listener" lock on port 443.
+3. **Firewall Drop on Ephemeral Ports:**
+   Tailscale Funnel ingress nodes continued routing traffic to the ephemeral session port (`37393`), where Tailscale's own macOS NetworkExtension packet filter dropped every packet with `no rules matched` (since ingress capability is only granted to 443). The incoming TLS handshake timed out with `EOF`.
+4. **Lack of Terminal Activity Feedback:**
+   Because incoming MCP requests were not logged by default, the user had no visibility into whether ChatGPT was reaching CodexPro or failing silently.
+
+### The Fix
+
+1. **Permanent Background Mode (`--bg`):**
+   * Modified `scripts/codexpro.mjs` to NEVER spawn Tailscale in transient foreground mode. It now registers directly into the system daemon via `tailscale funnel --bg <port>`.
+   * Background mode runs inside the persistent system daemon, survives sleep/wake and Wi-Fi changes, binds port 443 directly (eliminating ephemeral port drops), and leaves no zombie process locks.
+2. **Auto-Reconnecting Keepalive Watchdog:**
+   * Enhanced `startTunnelKeepAlive` with `onFail` and `onSuccess` hooks.
+   * If two consecutive healthcheck probes fail (e.g. after laptop wake-up or router reconnect), the watchdog automatically executes `tailscale funnel reset` + `tailscale funnel --bg <port>` to restore edge connectivity without user intervention.
+3. **Real-time Terminal Feedback for MCP Tool Calls:**
+   * In `src/http.ts`, added immediate console logging for MCP events:
+     `[CodexPro MCP] Calling tool: <tool_name>...`
+     `[CodexPro MCP] Tool <tool_name> completed in <ms>ms`
+     `[CodexPro MCP] Client connected: <client_name>`
+   * Provides immediate visual confirmation whenever ChatGPT calls a tool.
+
+### Verification
+
+* Executed `tools/call` for `open_current_workspace` over the public Funnel URL `https://macbook-pro-stas.tail64004b.ts.net/mcp`.
+* Request executed in 45ms and returned full workspace data with HTTP/2 200 OK.
+* Background daemon verified with `tailscale funnel status` (clean background serve config on port 443, no ephemeral ports, no packet filter drops).

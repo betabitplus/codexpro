@@ -1673,6 +1673,16 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    const started = Date.now();
+    const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
+    const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
+    if (toolName) {
+      console.log(`[CodexPro MCP] Calling tool: ${toolName}...`);
+    } else if (bodyMethod === "initialize") {
+      const clientName = (req.body as any).params?.clientInfo?.name ?? "client";
+      console.log(`[CodexPro MCP] Client connected: ${clientName}`);
+    }
+
     try {
       const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
@@ -1705,6 +1715,9 @@ async function main(): Promise<void> {
       }
 
       await transport.handleRequest(req, res, req.body);
+      if (toolName) {
+        console.log(`[CodexPro MCP] Tool ${toolName} completed in ${Date.now() - started}ms`);
+      }
     } catch (error) {
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
