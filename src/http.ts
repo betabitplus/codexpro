@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
@@ -9,6 +10,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { expandHome, loadConfig, type CodexProConfig } from "./config.js";
 import {
+  codexProHome,
   profilePathForRoot,
   readRuntimeConnection,
   readWorkspaceProfile,
@@ -1433,6 +1435,28 @@ function onboardingPage(config: CodexProConfig): string {
 </html>`;
 }
 
+const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function loadKnownSessions(): Set<string> {
+  try {
+    const file = path.join(codexProHome(), "sessions.json");
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (Array.isArray(data)) return new Set(data.filter((id) => typeof id === "string" && sessionIdPattern.test(id)));
+    }
+  } catch {}
+  return new Set();
+}
+
+function persistKnownSessions(sessions: Set<string>): void {
+  try {
+    const dir = codexProHome();
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "sessions.json");
+    fs.writeFileSync(file, JSON.stringify([...sessions].slice(-1000)), "utf8");
+  } catch {}
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.includes("--version") || argv.includes("-v") || argv[0] === "version") {
@@ -1561,9 +1585,9 @@ async function main(): Promise<void> {
     lastSeenAt: number;
   };
 
+  const knownSessions = loadKnownSessions();
   const transports = new Map<string, TransportRecord>();
-  const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
+  
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
     return Array.isArray(value) ? value[0] : value;
@@ -1603,13 +1627,39 @@ async function main(): Promise<void> {
     }
   }
 
-  function getTransport(sessionId: string | undefined): StreamableHTTPServerTransport | undefined {
+  async function getOrCreateTransport(sessionId: string | undefined): Promise<StreamableHTTPServerTransport | undefined> {
     if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
     pruneTransports();
     const record = transports.get(sessionId);
-    if (!record) return undefined;
-    record.lastSeenAt = Date.now();
-    return record.transport;
+    if (record) {
+      record.lastSeenAt = Date.now();
+      return record.transport;
+    }
+    if (!knownSessions.has(sessionId)) {
+      return undefined;
+    }
+    // Auto-restore session transparently for previously known session
+    console.log(`[CodexPro MCP] Auto-restoring session for ID: ${sessionId}`);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+      onsessionclosed: (closedSessionId: string) => {
+        if (closedSessionId) {
+          transports.delete(closedSessionId);
+          knownSessions.delete(closedSessionId);
+          persistKnownSessions(knownSessions);
+        }
+      }
+    } as any);
+    (transport as any)._webStandardTransport._initialized = true;
+    (transport as any)._webStandardTransport.sessionId = sessionId;
+    const server = createCodexProServer(config);
+    await server.connect(transport);
+    transports.set(sessionId, {
+      transport,
+      createdAt: Date.now(),
+      lastSeenAt: Date.now()
+    });
+    return transport;
   }
 
   const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
@@ -1685,9 +1735,9 @@ async function main(): Promise<void> {
 
     try {
       const sessionId = requestSessionId(req);
-      let transport: StreamableHTTPServerTransport;
+      let transport: StreamableHTTPServerTransport | undefined;
 
-      const existingTransport = getTransport(sessionId);
+      const existingTransport = await getOrCreateTransport(sessionId);
       if (existingTransport) {
         transport = existingTransport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
@@ -1695,15 +1745,21 @@ async function main(): Promise<void> {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             pruneTransports();
+            knownSessions.add(newSessionId);
+            persistKnownSessions(knownSessions);
             transports.set(newSessionId, {
-              transport,
+              transport: transport!,
               createdAt: Date.now(),
               lastSeenAt: Date.now()
             });
             pruneTransports();
           },
           onsessionclosed: (closedSessionId: string) => {
-            if (closedSessionId) transports.delete(closedSessionId);
+            if (closedSessionId) {
+              transports.delete(closedSessionId);
+              knownSessions.delete(closedSessionId);
+              persistKnownSessions(knownSessions);
+            }
           }
         } as any);
 
@@ -1732,7 +1788,7 @@ async function main(): Promise<void> {
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
     const sessionId = requestSessionId(req);
-    const transport = getTransport(sessionId);
+    const transport = await getOrCreateTransport(sessionId);
     if (!transport) {
       sendSessionError(res, sessionId);
       return;

@@ -286,3 +286,52 @@ Even with the transport session fix (`1acb9eb`), remote AI agents in ChatGPT Web
 * Executed `tools/call` for `open_current_workspace` over the public Funnel URL `https://macbook-pro-stas.tail64004b.ts.net/mcp`.
 * Request executed in 45ms and returned full workspace data with HTTP/2 200 OK.
 * Background daemon verified with `tailscale funnel status` (clean background serve config on port 443, no ephemeral ports, no packet filter drops).
+
+
+---
+
+## 10. The 17-Hour Idle Reaper: Hardcoded 30-Minute HTTP Session TTL & Transparent Auto-Restoration
+
+### Symptoms & Timeline
+
+* After running smoothly, ChatGPT suddenly fails with `Action failed: Tool disconnected` ("инструмент отваливается") when resuming a conversation after lunch or the next morning (~16-17 hours of idle gap).
+* Local Tailscale and `/healthz` endpoints report `HTTP 200 OK` and the tunnel is fully operational.
+* However, in the MCP request stream, ChatGPT receives:
+  ```json
+  HTTP/1.1 404 Not Found
+  {"jsonrpc": "2.0", "error": {"code": -32001, "message": "Session not found"}}
+  ```
+* ChatGPT treats any HTTP 404 response on an existing session as a fatal, unrecoverable disconnection, permanently breaking the chat.
+
+### Root Cause Analysis
+
+1. **Hardcoded 30-Minute HTTP Session TTL (`src/config.ts`):**
+   * `config.httpSessionTtlMs` was hardcoded to default to `30 * 60_000` (30 minutes).
+   * A periodic reaper timer ran every 60 seconds calling `pruneTransports()`, which permanently evicted any session whose `lastSeenAt` was older than 30 minutes.
+2. **Ephemeral In-Memory Transports Map (`src/http.ts`):**
+   * The `transports` collection was strictly an in-memory `Map<string, TransportRecord>`.
+   * When the user left their computer for >30 minutes (or overnight), the session was deleted from memory.
+   * Furthermore, whenever `codexpro` was restarted, all active session IDs were lost, breaking every open ChatGPT chat.
+3. **Running Old Process in Memory:**
+   * A long-running `codexpro start` process started the previous day at 21:00 remained running in the user's terminal.
+   * Even after codebase updates, the running Node.js process held the old compiled bytecode in RAM until explicitly restarted.
+
+### The Fix
+
+1. **Extended Default Session TTL:**
+   * In `src/config.ts`, increased the default `httpSessionTtlMs` from 30 minutes to **7 days** (`7 * 24 * 60 * 60_000`), with an upper bound of 30 days.
+2. **Persistent Session Registry (`~/.codexpro/sessions.json`):**
+   * In `src/http.ts`, added `loadKnownSessions()` and `persistKnownSessions()`.
+   * Whenever a legitimate session is initialized via `initialize`, its UUID is persisted to `~/.codexpro/sessions.json`.
+3. **Transparent Lazy Session Auto-Restoration (`getOrCreateTransport`):**
+   * When an incoming request arrives with a known `Mcp-Session-Id` that was pruned from RAM or wiped by a server restart:
+     * CodexPro automatically instantiates a new `StreamableHTTPServerTransport` with that session ID.
+     * Marks it initialized, connects a new `CodexProServer` instance, and registers it into the active `transports` Map.
+     * Executes the incoming tool call and returns `HTTP 200 OK` seamlessly.
+   * Unknown/invalid IDs (such as smoke test `00000000-0000-4000-8000-000000000000`) and explicitly closed sessions (`DELETE /mcp`) continue to return `404 Session not found` in strict accordance with the MCP specification.
+
+### Verification
+
+* Verified 100% pass rate across the entire test suite (`npm run smoke`):
+  * `analysis`, `analysis-cli`, `smoke`, `chatgpt-export`, `skill-precedence`, `import`, `http`, `widget`, `pro`, `doctor`, `settings`, `execute-handoff`, `release-guard`.
+* Verified direct auto-restoration via `curl` with persistent known session IDs.
