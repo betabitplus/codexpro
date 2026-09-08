@@ -1482,11 +1482,38 @@ async function main(): Promise<void> {
   const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
   const authFailureLimit = 10;
 
+  function loadValidAuthTokens(): Set<string> {
+    const tokens = new Set<string>();
+    if (config.authToken) tokens.add(config.authToken);
+    try {
+      const dir = path.join(codexProHome(), "profiles");
+      if (fs.existsSync(dir)) {
+        for (const entry of fs.readdirSync(dir)) {
+          if (!entry.endsWith(".json")) continue;
+          try {
+            const profile = JSON.parse(fs.readFileSync(path.join(dir, entry), "utf8"));
+            if (profile && typeof profile.token === "string" && profile.token.trim()) {
+              tokens.add(profile.token.trim());
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+    return tokens;
+  }
+
+  const validTokens = loadValidAuthTokens();
+
   function tokenMatches(value: unknown): boolean {
-    if (!config.authToken || typeof value !== "string") return false;
-    const expected = Buffer.from(config.authToken);
+    if (validTokens.size === 0 || typeof value !== "string") return false;
     const actual = Buffer.from(value);
-    return expected.length === actual.length && timingSafeEqual(expected, actual);
+    for (const expectedStr of validTokens) {
+      const expected = Buffer.from(expectedStr);
+      if (expected.length === actual.length && timingSafeEqual(expected, actual)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   const adminRateWindow = new Map<string, { count: number; resetAt: number }>();
@@ -1518,14 +1545,16 @@ async function main(): Promise<void> {
   }
 
   app.use((req, res, next) => {
-    if (!logRequests) {
-      next();
-      return;
+    if (logRequests) {
+      console.error(`[CodexPro] ${req.method} ${req.path} received`);
     }
     const started = Date.now();
-    console.error(`[CodexPro] ${req.method} ${req.path} received`);
     res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      if (res.statusCode >= 400) {
+        console.error(`[CodexPro MCP] ${req.method} ${req.originalUrl || req.path} -> ${res.statusCode} (${Date.now() - started}ms)`);
+      } else if (logRequests) {
+        console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      }
     });
     next();
   });
@@ -1627,18 +1656,23 @@ async function main(): Promise<void> {
     }
   }
 
+  const closedSessions = new Set<string>();
   const inFlightTransports = new Map<string, Promise<StreamableHTTPServerTransport | undefined>>();
 
   async function getOrCreateTransport(sessionId: string | undefined): Promise<StreamableHTTPServerTransport | undefined> {
-    if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
+    if (
+      !sessionId ||
+      !sessionIdPattern.test(sessionId) ||
+      closedSessions.has(sessionId) ||
+      sessionId === "00000000-0000-4000-8000-000000000000"
+    ) {
+      return undefined;
+    }
     pruneTransports();
     const record = transports.get(sessionId);
     if (record) {
       record.lastSeenAt = Date.now();
       return record.transport;
-    }
-    if (!knownSessions.has(sessionId)) {
-      return undefined;
     }
     const inFlight = inFlightTransports.get(sessionId);
     if (inFlight) return inFlight;
@@ -1647,15 +1681,16 @@ async function main(): Promise<void> {
       try {
         console.log(`[CodexPro MCP] Initializing/restoring session for ID: ${sessionId}`);
         const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => sessionId,
-          onsessionclosed: (closedSessionId: string) => {
-            if (closedSessionId) {
-              transports.delete(closedSessionId);
-              knownSessions.delete(closedSessionId);
-              persistKnownSessions(knownSessions);
-            }
-          }
+          sessionIdGenerator: () => sessionId
         } as any);
+        transport.onclose = () => {
+          if (sessionId) {
+            closedSessions.add(sessionId);
+            transports.delete(sessionId);
+            knownSessions.delete(sessionId);
+            persistKnownSessions(knownSessions);
+          }
+        };
         (transport as any)._webStandardTransport._initialized = true;
         (transport as any)._webStandardTransport.sessionId = sessionId;
         const server = createCodexProServer(config);
@@ -1756,9 +1791,11 @@ async function main(): Promise<void> {
       if (existingTransport) {
         transport = existingTransport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        let assignedSessionId = "";
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
+            assignedSessionId = newSessionId;
             pruneTransports();
             knownSessions.add(newSessionId);
             persistKnownSessions(knownSessions);
@@ -1768,15 +1805,17 @@ async function main(): Promise<void> {
               lastSeenAt: Date.now()
             });
             pruneTransports();
-          },
-          onsessionclosed: (closedSessionId: string) => {
-            if (closedSessionId) {
-              transports.delete(closedSessionId);
-              knownSessions.delete(closedSessionId);
-              persistKnownSessions(knownSessions);
-            }
           }
         } as any);
+        transport.onclose = () => {
+          const sid = assignedSessionId || transport?.sessionId;
+          if (sid) {
+            closedSessions.add(sid);
+            transports.delete(sid);
+            knownSessions.delete(sid);
+            persistKnownSessions(knownSessions);
+          }
+        };
 
         const server = createCodexProServer(config);
         await server.connect(transport);
@@ -1815,6 +1854,12 @@ async function main(): Promise<void> {
     if (!transport) {
       sendSessionError(res, sessionId);
       return;
+    }
+    if (req.method === "DELETE" && sessionId) {
+      closedSessions.add(sessionId);
+      transports.delete(sessionId);
+      knownSessions.delete(sessionId);
+      persistKnownSessions(knownSessions);
     }
     await transport.handleRequest(req, res);
   };
