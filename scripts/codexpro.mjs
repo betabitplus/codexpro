@@ -1104,30 +1104,56 @@ function isTailscaleFunnelActive(tailscalePath, targetPort = 8787) {
   return false;
 }
 
-function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000) {
+function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, onFail = null, onSuccess = null) {
   let active = true;
   let inFlight = false;
+  let lastTick = Date.now();
+  let failCount = 0;
+
+  const sleepWatcher = setInterval(() => {
+    if (!active) return;
+    const now = Date.now();
+    const gap = now - lastTick;
+    lastTick = now;
+    if (gap > 4000) {
+      if (typeof onFail === 'function') {
+        onFail('Mac resumed from sleep');
+      }
+    }
+  }, 1000);
+  sleepWatcher.unref();
+
   const ping = async () => {
     if (!active || inFlight) return;
     inFlight = true;
     const start = Date.now();
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
+      const timeout = setTimeout(() => controller.abort(), 6000);
       const res = await fetch(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal
       });
       clearTimeout(timeout);
       const elapsed = Date.now() - start;
-      if (!res.ok && verbose) {
-        console.warn(`[tunnel-keepalive] Warning: probe returned status ${res.status} in ${elapsed}ms`);
-      } else if (elapsed > 3500 && verbose) {
-        console.warn(`[tunnel-keepalive] High latency: ${elapsed}ms`);
+      if (res.ok) {
+        failCount = 0;
+        if (typeof onSuccess === 'function') onSuccess();
+        if (elapsed > 3500 && verbose) {
+          console.warn(`[tunnel-keepalive] High latency: ${elapsed}ms`);
+        }
+      } else {
+        failCount++;
+        if (verbose) console.warn(`[tunnel-keepalive] Warning: probe returned status ${res.status} in ${elapsed}ms`);
+        if (failCount >= 2 && typeof onFail === 'function') {
+          onFail(`HTTP probe returned status ${res.status}`);
+        }
       }
     } catch (err) {
-      if (active && verbose) {
-        console.warn(`[tunnel-keepalive] Probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      failCount++;
+      if (verbose) console.warn(`[tunnel-keepalive] Probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (failCount >= 2 && typeof onFail === 'function') {
+        onFail(`Probe failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     } finally {
       inFlight = false;
@@ -1139,6 +1165,7 @@ function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000) {
   return () => {
     active = false;
     clearInterval(timer);
+    clearInterval(sleepWatcher);
   };
 }
 
@@ -4204,6 +4231,55 @@ async function main() {
     const tailscalePath = resolveTailscale(effectiveArgs);
     const publicBase = publicBaseFromHostname(stableHostname);
     const httpsPort = tailscaleFunnelHttpsPort(publicBase);
+    let isHealing = false;
+    let shuttingDown = false;
+    let isReady = false;
+
+    cleanupTunnelCredentials = () => {
+      shuttingDown = true;
+      try {
+        spawnSyncPortable(tailscalePath, ['funnel', 'reset'], { stdio: 'ignore', timeout: 5000 });
+      } catch {}
+    };
+
+    const spawnFunnelProcess = () => {
+      const tailscaleArgs = ['funnel'];
+      if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
+      tailscaleArgs.push(localBase);
+      const child = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+      child.on('exit', (code, signal) => {
+        if (isReady && !shuttingDown && !isHealing) {
+          selfHeal(`tailscale funnel process exited code=${code} signal=${signal}`).catch(() => {});
+        }
+      });
+      return child;
+    };
+
+    const selfHeal = async (reason = 'connection loss') => {
+      if (isHealing || shuttingDown || !isReady) return;
+      isHealing = true;
+      statusLine('warn', `Tailscale Funnel degraded (${reason}). Self-healing connection...`);
+      try {
+        if (cloudflared && !cloudflared.killed) {
+          try { cloudflared.kill('SIGTERM'); } catch {}
+        }
+        try {
+          spawnSyncPortable(tailscalePath, ['funnel', 'reset'], { stdio: 'ignore', timeout: 5000 });
+        } catch {}
+        try {
+          spawnSyncPortable(tailscalePath, ['debug', 'clear-netmap-cache'], { stdio: 'ignore', timeout: 3000 });
+          spawnSyncPortable(tailscalePath, ['debug', 'force-netmap-update'], { stdio: 'ignore', timeout: 3000 });
+        } catch {}
+        cloudflared = spawnFunnelProcess();
+        await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel', 30000);
+        statusLine('ok', `Tailscale Funnel restored and reachable at ${publicBase}`);
+      } catch (err) {
+        statusLine('warn', `Tailscale Funnel self-healing attempt failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        isHealing = false;
+      }
+    };
+
     const alreadyServing = isTailscaleFunnelActive(tailscalePath, port);
     let healthy = false;
     if (alreadyServing) {
@@ -4211,6 +4287,7 @@ async function main() {
       try {
         await waitForPublicHealth(publicBase, token, null, 'Tailscale Funnel', 5000);
         healthy = true;
+        isReady = true;
         statusLine('ok', `Tailscale Funnel active and reachable at ${publicBase}`);
       } catch {
         statusLine('warn', `Existing Tailscale Funnel was unresponsive. Resetting and reopening for ${publicBase}...`);
@@ -4220,13 +4297,11 @@ async function main() {
       }
     }
     if (!healthy) {
-      const tailscaleArgs = ['funnel'];
-      if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
-      tailscaleArgs.push(localBase);
       statusLine('wait', `Opening Tailscale Funnel for ${publicBase}`);
-      cloudflared = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
+      cloudflared = spawnFunnelProcess();
       try {
         await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
+        isReady = true;
       } catch (error) {
         const tail = typeof cloudflared?.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
         const hint = [
@@ -4242,7 +4317,17 @@ async function main() {
         throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
       }
     }
-    stopTunnelKeepAlive = startTunnelKeepAlive(`${publicBase}/healthz`, token, verboseLogs, 20000);
+    stopTunnelKeepAlive = startTunnelKeepAlive(
+      `${publicBase}/healthz`,
+      token,
+      verboseLogs,
+      15000,
+      (reason) => {
+        if (isReady) {
+          selfHeal(reason).catch(() => {});
+        }
+      }
+    );
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
       headless,

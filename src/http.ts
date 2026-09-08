@@ -1453,7 +1453,7 @@ function persistKnownSessions(sessions: Set<string>): void {
     const dir = codexProHome();
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "sessions.json");
-    fs.writeFileSync(file, JSON.stringify([...sessions].slice(-1000)), "utf8");
+    fs.writeFileSync(file, JSON.stringify([...sessions].slice(-50000)), "utf8");
   } catch {}
 }
 
@@ -1627,6 +1627,8 @@ async function main(): Promise<void> {
     }
   }
 
+  const inFlightTransports = new Map<string, Promise<StreamableHTTPServerTransport | undefined>>();
+
   async function getOrCreateTransport(sessionId: string | undefined): Promise<StreamableHTTPServerTransport | undefined> {
     if (!sessionId || !sessionIdPattern.test(sessionId)) return undefined;
     pruneTransports();
@@ -1638,28 +1640,41 @@ async function main(): Promise<void> {
     if (!knownSessions.has(sessionId)) {
       return undefined;
     }
-    // Auto-restore session transparently for previously known session
-    console.log(`[CodexPro MCP] Auto-restoring session for ID: ${sessionId}`);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => sessionId,
-      onsessionclosed: (closedSessionId: string) => {
-        if (closedSessionId) {
-          transports.delete(closedSessionId);
-          knownSessions.delete(closedSessionId);
-          persistKnownSessions(knownSessions);
-        }
+    const inFlight = inFlightTransports.get(sessionId);
+    if (inFlight) return inFlight;
+
+    const initPromise = (async () => {
+      try {
+        console.log(`[CodexPro MCP] Initializing/restoring session for ID: ${sessionId}`);
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => sessionId,
+          onsessionclosed: (closedSessionId: string) => {
+            if (closedSessionId) {
+              transports.delete(closedSessionId);
+              knownSessions.delete(closedSessionId);
+              persistKnownSessions(knownSessions);
+            }
+          }
+        } as any);
+        (transport as any)._webStandardTransport._initialized = true;
+        (transport as any)._webStandardTransport.sessionId = sessionId;
+        const server = createCodexProServer(config);
+        await server.connect(transport);
+        knownSessions.add(sessionId);
+        persistKnownSessions(knownSessions);
+        transports.set(sessionId, {
+          transport,
+          createdAt: Date.now(),
+          lastSeenAt: Date.now()
+        });
+        return transport;
+      } finally {
+        inFlightTransports.delete(sessionId);
       }
-    } as any);
-    (transport as any)._webStandardTransport._initialized = true;
-    (transport as any)._webStandardTransport.sessionId = sessionId;
-    const server = createCodexProServer(config);
-    await server.connect(transport);
-    transports.set(sessionId, {
-      transport,
-      createdAt: Date.now(),
-      lastSeenAt: Date.now()
-    });
-    return transport;
+    })();
+
+    inFlightTransports.set(sessionId, initPromise);
+    return initPromise;
   }
 
   const pruneTimer = setInterval(pruneTransports, Math.min(config.httpSessionTtlMs, 60_000));
@@ -1722,7 +1737,7 @@ async function main(): Promise<void> {
     jsonError(res, 405, "method_not_allowed", "Use GET or POST for /admin/profile.");
   });
 
-  app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+  const handleMcpPost = async (req: express.Request, res: express.Response) => {
     const started = Date.now();
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
@@ -1784,6 +1799,14 @@ async function main(): Promise<void> {
         });
       }
     }
+  };
+
+  app.post("/mcp", express.json({ limit: "20mb" }), handleMcpPost);
+  app.post("/", express.json({ limit: "20mb" }), (req, res) => {
+    if (req.headers["mcp-session-id"] || isInitializeRequest(req.body) || (req.body && typeof req.body === "object" && "jsonrpc" in req.body)) {
+      return handleMcpPost(req, res);
+    }
+    return res.status(200).json({ ok: true, name: "CodexPro", mcp: "/mcp" });
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
@@ -1810,7 +1833,7 @@ async function main(): Promise<void> {
       return;
     }
     const status = type === "entity.too.large" ? 413 : 400;
-    if (req.path === "/mcp") {
+    if (req.path === "/mcp" || req.path === "/") {
       res.status(status).json({
         jsonrpc: "2.0",
         error: {

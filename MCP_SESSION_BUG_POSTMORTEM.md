@@ -335,3 +335,63 @@ Even with the transport session fix (`1acb9eb`), remote AI agents in ChatGPT Web
 * Verified 100% pass rate across the entire test suite (`npm run smoke`):
   * `analysis`, `analysis-cli`, `smoke`, `chatgpt-export`, `skill-precedence`, `import`, `http`, `widget`, `pro`, `doctor`, `settings`, `execute-handoff`, `release-guard`.
 * Verified direct auto-restoration via `curl` with persistent known session IDs.
+
+---
+
+## 11. Multi-Ingress Edge Relay Desync (`SSL_ERROR_SYSCALL`), macOS Sleep/Wake Zombie Trap & Active Self-Healing Watchdog
+
+### Symptoms & Timeline
+
+* After several hours of uptime or after waking a MacBook from sleep, remote AI agents (ChatGPT Web) intermittently fail with `Action failed: Tool disconnected` ("инструмент отваливается").
+* In some cases, local tests (`http://127.0.0.1:8787` and internal Tailnet MagicDNS `100.x`) succeed, but external requests from the public internet fail during the TLS handshake with:
+  ```
+  LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to macbook-pro-stas.tail64004b.ts.net:443
+  [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1007)
+  ```
+* In macOS system logs (`/usr/bin/log show --predicate 'process == "io.tailscale.ipn.macsys.network-extension"'`), persistent packet filter drops occur:
+  ```
+  Drop: TCP{[fd7a:115c:a1e0::...]:port > [fd7a:115c:a1e0::cf01:d2c4]:37393} 80 no rules matched
+  ```
+  where port `37393` is Tailscale's internal `PeerAPIURL` on IPv6 (`http://[fd7a:115c:a1e0::cf01:d2c4]:37393`).
+
+### Root Cause Analysis
+
+1. **Anycast Edge Relay Netmap Desynchronization (GitHub Issue #19290 & #20949):**
+   * Tailscale Funnel publishes multiple Anycast edge ingress IPs worldwide (e.g. `185.40.234.55`, `185.40.234.75`, `185.40.234.198`).
+   * Remote agents connect to whichever Anycast edge node their cloud provider routes to. When network routes cycle or after a period of inactivity, one or more Anycast edge relays can lose netmap synchronization with the node. When the edge relay attempts to establish the TLS session or route to the local node, it terminates the connection prematurely (`SSL_ERROR_SYSCALL`).
+2. **The macOS Sleep/Wake Zombie Process Trap:**
+   * When macOS goes to sleep, the `io.tailscale.ipn.macsys.network-extension` daemon drops the active serve session (`Hostinfo.IngressEnabled changed to false`).
+   * However, the foreground CLI child process (`tailscale funnel http://127.0.0.1:8787`) remains alive in Node.js as a zombie process without exiting.
+   * When macOS wakes up, `tailscale funnel status` reports `No serve config`. The CLI child process continues to run doing nothing, while all external incoming packets from the edge ingress nodes are dropped by the macOS packet filter with `no rules matched`.
+3. **OpenAI Root Path Probes (`POST /`):**
+   * When ChatGPT registers or reconnects to an MCP connector, it periodically issues HTTP probes to the root path (`POST /`). Because CodexPro only registered `POST /mcp`, probes to `/` returned HTTP 404, triggering `MCP_ACTION_DISCOVERY_FAILED`.
+4. **Session Eviction Under Test & In-Flight Concurrency:**
+   * The `knownSessions` persistence cap was set to 1,000, which could be evicted if test suites ran on the same system. In addition, parallel requests arriving for a restored session could trigger duplicate server instantiations without in-flight promise deduplication.
+
+### The Fix
+
+1. **Unref Sleep/Wake Heartbeat Detector in `startTunnelKeepAlive` (`scripts/codexpro.mjs`):**
+   * Added a 1-second unref interval checking timestamp drift (`now - lastTick > 4000ms`).
+   * When macOS sleeps and wakes, the detector immediately identifies the sleep resumption gap and triggers `onFail('Mac resumed from sleep')`.
+2. **Edge Reachability Watchdog & Auto Self-Healing (`scripts/codexpro.mjs`):**
+   * The keepalive watchdog actively queries `${publicBase}/healthz` every 15 seconds through the public Anycast edge relay.
+   * If 2 consecutive probes fail or upon sleep resumption, it executes `selfHeal()`:
+     1. Kills any stale or zombie child process (`SIGTERM`).
+     2. Resets the Funnel configuration via `tailscale funnel reset`.
+     3. Flushes and forces a netmap resync via `tailscale debug clear-netmap-cache && tailscale debug force-netmap-update`.
+     4. Re-spawns the Funnel process.
+     5. Waits up to 30 seconds for `waitForPublicHealth` to verify end-to-end edge reachability.
+3. **Clean Shutdown Reset (`scripts/codexpro.mjs`):**
+   * `cleanupTunnelCredentials` now executes `tailscale funnel reset` to avoid leaving stale port forwards when the user exits CodexPro.
+4. **Root Path Support (`src/http.ts`):**
+   * Added `app.post("/", ...)` handler that routes JSON-RPC MCP requests to `handleMcpPost` and responds with `{ ok: true, name: "CodexPro", mcp: "/mcp" }` for probes.
+5. **Deduplicated In-Flight Transports & 50k Cap (`src/http.ts`):**
+   * Added `inFlightTransports` Map to deduplicate concurrent session initialization promises.
+   * Increased session persistence cap to 50,000 entries.
+
+### Verification
+
+* Verified 100% pass across all 13 smoke tests (`npm run smoke`):
+  * `analysis`, `analysis-cli`, `smoke`, `chatgpt-export`, `skill-precedence`, `import`, `http`, `widget`, `pro`, `doctor`, `settings`, `execute-handoff`, `release-guard`.
+* Verified branch integrity (`npm run path-rules:verify`).
+* Verified clean live Anycast edge relay routing (`185.40.234.55:443`) returning HTTP 200 OK with TLS 1.3 certificate verification.
