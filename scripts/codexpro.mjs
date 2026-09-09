@@ -8,6 +8,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import dns from 'node:dns';
+import http from 'node:http';
+import https from 'node:https';
 import {
   CLOUDFLARED_VERSION,
   cloudflaredReleaseAsset,
@@ -1050,6 +1053,66 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithDnsFallback(url, options = {}) {
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    const isDnsError = err && (
+      err.code === 'ENOTFOUND' ||
+      err.cause?.code === 'ENOTFOUND' ||
+      String(err.message || '').includes('ENOTFOUND') ||
+      String(err.cause?.message || '').includes('ENOTFOUND')
+    );
+    if (!isDnsError) throw err;
+    const parsed = new URL(url);
+    const resolver = new dns.promises.Resolver();
+    resolver.setServers(['1.1.1.1', '8.8.8.8']);
+    const addrs = await resolver.resolve4(parsed.hostname).catch(() => []);
+    if (!addrs || addrs.length === 0) throw err;
+    const ip = addrs[0];
+    const isHttps = parsed.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const port = parsed.port || (isHttps ? 443 : 80);
+
+    return await new Promise((resolve, reject) => {
+      const headers = { ...(options.headers || {}), host: parsed.hostname };
+      const req = client.request({
+        host: ip,
+        port,
+        path: parsed.pathname + parsed.search,
+        method: options.method || 'GET',
+        headers,
+        servername: parsed.hostname,
+        signal: options.signal,
+        timeout: 5000
+      }, (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const bodyBuffer = Buffer.concat(chunks);
+          const bodyText = bodyBuffer.toString('utf8');
+          resolve({
+            ok: (res.statusCode >= 200 && res.statusCode < 300),
+            status: res.statusCode,
+            statusText: res.statusMessage,
+            text: async () => bodyText,
+            json: async () => JSON.parse(bodyText),
+            headers: new Headers(res.headers)
+          });
+        });
+      });
+      req.on('error', reject);
+      req.on('timeout', () => {
+        req.destroy(new Error(`Timeout connecting to ${parsed.hostname} (${ip})`));
+      });
+      if (options.body) {
+        req.write(options.body);
+      }
+      req.end();
+    });
+  }
+}
+
 async function waitForHealth(url, token, timeoutMs = 15000) {
   const started = Date.now();
   let lastError = '';
@@ -1057,7 +1120,7 @@ async function waitForHealth(url, token, timeoutMs = 15000) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(url, {
+      const res = await fetchWithDnsFallback(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal
       });
@@ -1107,21 +1170,7 @@ function isTailscaleFunnelActive(tailscalePath, targetPort = 8787) {
 function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, onFail = null, onSuccess = null) {
   let active = true;
   let inFlight = false;
-  let lastTick = Date.now();
   let failCount = 0;
-
-  const sleepWatcher = setInterval(() => {
-    if (!active) return;
-    const now = Date.now();
-    const gap = now - lastTick;
-    lastTick = now;
-    if (gap > 4000) {
-      if (typeof onFail === 'function') {
-        onFail('Mac resumed from sleep');
-      }
-    }
-  }, 1000);
-  sleepWatcher.unref();
 
   const ping = async () => {
     if (!active || inFlight) return;
@@ -1130,7 +1179,7 @@ function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, o
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      const res = await fetch(url, {
+      const res = await fetchWithDnsFallback(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal
       });
@@ -1165,7 +1214,6 @@ function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, o
   return () => {
     active = false;
     clearInterval(timer);
-    clearInterval(sleepWatcher);
   };
 }
 
@@ -4231,7 +4279,6 @@ async function main() {
     const tailscalePath = resolveTailscale(effectiveArgs);
     const publicBase = publicBaseFromHostname(stableHostname);
     const httpsPort = tailscaleFunnelHttpsPort(publicBase);
-    let isHealing = false;
     let shuttingDown = false;
     let isReady = false;
 
@@ -4248,36 +4295,15 @@ async function main() {
       tailscaleArgs.push(localBase);
       const child = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
       child.on('exit', (code, signal) => {
-        if (isReady && !shuttingDown && !isHealing) {
-          selfHeal(`tailscale funnel process exited code=${code} signal=${signal}`).catch(() => {});
+        if (shuttingDown) return;
+        if (isTailscaleFunnelActive(tailscalePath, port)) {
+          return;
+        }
+        if (isReady && verboseLogs) {
+          statusLine('warn', `Tailscale Funnel process exited code=${code} signal=${signal}`);
         }
       });
       return child;
-    };
-
-    const selfHeal = async (reason = 'connection loss') => {
-      if (isHealing || shuttingDown || !isReady) return;
-      isHealing = true;
-      statusLine('warn', `Tailscale Funnel degraded (${reason}). Self-healing connection...`);
-      try {
-        if (cloudflared && !cloudflared.killed) {
-          try { cloudflared.kill('SIGTERM'); } catch {}
-        }
-        try {
-          spawnSyncPortable(tailscalePath, ['funnel', 'reset'], { stdio: 'ignore', timeout: 5000 });
-        } catch {}
-        try {
-          spawnSyncPortable(tailscalePath, ['debug', 'clear-netmap-cache'], { stdio: 'ignore', timeout: 3000 });
-          spawnSyncPortable(tailscalePath, ['debug', 'force-netmap-update'], { stdio: 'ignore', timeout: 3000 });
-        } catch {}
-        cloudflared = spawnFunnelProcess();
-        await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel', 30000);
-        statusLine('ok', `Tailscale Funnel restored and reachable at ${publicBase}`);
-      } catch (err) {
-        statusLine('warn', `Tailscale Funnel self-healing attempt failed: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        isHealing = false;
-      }
     };
 
     const alreadyServing = isTailscaleFunnelActive(tailscalePath, port);
@@ -4290,10 +4316,11 @@ async function main() {
         isReady = true;
         statusLine('ok', `Tailscale Funnel active and reachable at ${publicBase}`);
       } catch {
-        statusLine('warn', `Existing Tailscale Funnel was unresponsive. Resetting and reopening for ${publicBase}...`);
-        try {
-          spawnSyncPortable(tailscalePath, ['funnel', 'reset'], { stdio: 'ignore', timeout: 5000 });
-        } catch {}
+        if (isTailscaleFunnelActive(tailscalePath, port)) {
+          healthy = true;
+          isReady = true;
+          statusLine('ok', `Tailscale Funnel active in daemon for ${publicBase}`);
+        }
       }
     }
     if (!healthy) {
@@ -4303,30 +4330,30 @@ async function main() {
         await waitForPublicHealth(publicBase, token, cloudflared, 'Tailscale Funnel');
         isReady = true;
       } catch (error) {
-        const tail = typeof cloudflared?.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
-        const hint = [
-          '',
-          'Tailscale Funnel needs one-time setup before this can succeed:',
-          '',
-          '  install and log in to Tailscale',
-          '  enable MagicDNS, HTTPS certificates, and Funnel for this tailnet',
-          '  codexpro tailscale --hostname your-device.your-tailnet.ts.net --token keep-this-stable-token',
-          '',
-          'Funnel exposes this connector publicly. Keep the CodexPro token enabled.'
-        ].join('\n');
-        throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
+        if (isTailscaleFunnelActive(tailscalePath, port)) {
+          isReady = true;
+          statusLine('ok', `Tailscale Funnel active in daemon for ${publicBase}`);
+        } else {
+          const tail = typeof cloudflared?.codexproLogTail === 'function' ? cloudflared.codexproLogTail() : '';
+          const hint = [
+            '',
+            'Tailscale Funnel needs one-time setup before this can succeed:',
+            '',
+            '  install and log in to Tailscale',
+            '  enable MagicDNS, HTTPS certificates, and Funnel for this tailnet',
+            '  codexpro tailscale --hostname your-device.your-tailnet.ts.net --token keep-this-stable-token',
+            '',
+            'Funnel exposes this connector publicly. Keep the CodexPro token enabled.'
+          ].join('\n');
+          throw new Error(`${error instanceof Error ? error.message : String(error)}${tail ? `\n\nRecent tailscale output:\n${tail}` : ''}${hint}`);
+        }
       }
     }
     stopTunnelKeepAlive = startTunnelKeepAlive(
       `${publicBase}/healthz`,
       token,
       verboseLogs,
-      15000,
-      (reason) => {
-        if (isReady) {
-          selfHeal(reason).catch(() => {});
-        }
-      }
+      20000
     );
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
