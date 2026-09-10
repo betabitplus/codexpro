@@ -834,7 +834,7 @@ const tailscaleFailure = runFail([
   'codexpro-tailscale-token',
   '--no-copy-url'
 ], env, /Recent tailscale output/);
-if (!tailscaleFailure.includes(`funnel|http://127.0.0.1:${tailscalePort}`)) {
+if (!tailscaleFailure.includes('funnel') || !tailscaleFailure.includes(`http://127.0.0.1:${tailscalePort}`)) {
   throw new Error(`tailscale start did not invoke Funnel against the local server\n${tailscaleFailure}`);
 }
 const tailscalePortRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codexpro-settings-tailscale-port-'));
@@ -855,7 +855,7 @@ const tailscalePortFailure = runFail([
   'codexpro-tailscale-token',
   '--no-copy-url'
 ], env, /Recent tailscale output/);
-if (!tailscalePortFailure.includes(`funnel|--https=8443|http://127.0.0.1:${tailscalePort8443}`)) {
+if (!tailscalePortFailure.includes('funnel') || !tailscalePortFailure.includes('--https=8443') || !tailscalePortFailure.includes(`http://127.0.0.1:${tailscalePort8443}`)) {
   throw new Error(`tailscale start did not map hostname port to Funnel HTTPS port\n${tailscalePortFailure}`);
 }
 

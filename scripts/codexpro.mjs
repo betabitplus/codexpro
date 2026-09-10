@@ -1165,11 +1165,6 @@ function isTailscaleFunnelActive(tailscalePath, targetPort = 8787) {
         return true;
       };
       if (checkConfig(parsed)) return true;
-      if (parsed.Foreground && typeof parsed.Foreground === 'object') {
-        for (const session of Object.values(parsed.Foreground)) {
-          if (checkConfig(session)) return true;
-        }
-      }
     }
   } catch {}
   return false;
@@ -1529,6 +1524,9 @@ async function waitForPublicHealth(publicBase, token, tunnelChild, tunnelLabel =
   const health = waitForHealth(`${publicBase}/healthz`, token, timeoutMs);
   if (!tunnelChild) return health;
   const exit = waitForProcessExit(tunnelChild).then(({ code, signal }) => {
+    if (code === 0) {
+      return health;
+    }
     throw new Error(`${tunnelLabel} exited before ${publicBase}/healthz was reachable, code=${code} signal=${signal}`);
   });
   return Promise.race([health, exit]);
@@ -4298,7 +4296,7 @@ async function main() {
     };
 
     const spawnFunnelProcess = () => {
-      const tailscaleArgs = ['funnel'];
+      const tailscaleArgs = ['funnel', '--bg', '--yes'];
       if (httpsPort !== '443') tailscaleArgs.push(`--https=${httpsPort}`);
       tailscaleArgs.push(localBase);
       const child = spawnLogged('tailscale', tailscalePath, tailscaleArgs, { cwd: root, env: process.env, verbose: verboseLogs });
@@ -4365,6 +4363,10 @@ async function main() {
       () => {
         try {
           spawnSyncPortable(tailscalePath, ['debug', 'force-netmap-update'], { stdio: 'ignore', timeout: 3000 });
+          const healArgs = ['funnel', '--bg', '--yes'];
+          if (httpsPort !== '443') healArgs.push(`--https=${httpsPort}`);
+          healArgs.push(localBase);
+          spawnSyncPortable(tailscalePath, healArgs, { stdio: 'ignore', timeout: 5000 });
         } catch {}
       }
     );
