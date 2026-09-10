@@ -1685,10 +1685,7 @@ async function main(): Promise<void> {
         } as any);
         transport.onclose = () => {
           if (sessionId) {
-            closedSessions.add(sessionId);
             transports.delete(sessionId);
-            knownSessions.delete(sessionId);
-            persistKnownSessions(knownSessions);
           }
         };
         (transport as any)._webStandardTransport._initialized = true;
@@ -1810,10 +1807,7 @@ async function main(): Promise<void> {
         transport.onclose = () => {
           const sid = assignedSessionId || transport?.sessionId;
           if (sid) {
-            closedSessions.add(sid);
             transports.delete(sid);
-            knownSessions.delete(sid);
-            persistKnownSessions(knownSessions);
           }
         };
 
@@ -1901,7 +1895,7 @@ async function main(): Promise<void> {
     next(error);
   });
 
-  app.listen(config.port, config.host, () => {
+  const server = app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);
@@ -1909,7 +1903,17 @@ async function main(): Promise<void> {
     console.error(`[CodexPro] writeMode=${config.writeMode}`);
     console.error(`[CodexPro] widgetDomain=${config.widgetDomain}`);
   });
+
+  // Prevent reverse proxy keep-alive race conditions (Tailscale Funnel, Cloudflare, etc.)
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.requestTimeout = 0;
+  server.timeout = 0;
 }
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[CodexPro HTTP] Unhandled rejection:", reason);
+});
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));

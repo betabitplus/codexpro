@@ -1069,47 +1069,55 @@ async function fetchWithDnsFallback(url, options = {}) {
     resolver.setServers(['1.1.1.1', '8.8.8.8']);
     const addrs = await resolver.resolve4(parsed.hostname).catch(() => []);
     if (!addrs || addrs.length === 0) throw err;
-    const ip = addrs[0];
     const isHttps = parsed.protocol === 'https:';
     const client = isHttps ? https : http;
     const port = parsed.port || (isHttps ? 443 : 80);
 
-    return await new Promise((resolve, reject) => {
-      const headers = { ...(options.headers || {}), host: parsed.hostname };
-      const req = client.request({
-        host: ip,
-        port,
-        path: parsed.pathname + parsed.search,
-        method: options.method || 'GET',
-        headers,
-        servername: parsed.hostname,
-        signal: options.signal,
-        timeout: 5000
-      }, (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const bodyBuffer = Buffer.concat(chunks);
-          const bodyText = bodyBuffer.toString('utf8');
-          resolve({
-            ok: (res.statusCode >= 200 && res.statusCode < 300),
-            status: res.statusCode,
-            statusText: res.statusMessage,
-            text: async () => bodyText,
-            json: async () => JSON.parse(bodyText),
-            headers: new Headers(res.headers)
+    let lastErr = err;
+    for (const ip of addrs) {
+      try {
+        const result = await new Promise((resolve, reject) => {
+          const headers = { ...(options.headers || {}), host: parsed.hostname };
+          const req = client.request({
+            host: ip,
+            port,
+            path: parsed.pathname + parsed.search,
+            method: options.method || 'GET',
+            headers,
+            servername: parsed.hostname,
+            signal: options.signal,
+            timeout: 5000
+          }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+              const bodyBuffer = Buffer.concat(chunks);
+              const bodyText = bodyBuffer.toString('utf8');
+              resolve({
+                ok: (res.statusCode >= 200 && res.statusCode < 300),
+                status: res.statusCode,
+                statusText: res.statusMessage,
+                text: async () => bodyText,
+                json: async () => JSON.parse(bodyText),
+                headers: new Headers(res.headers)
+              });
+            });
           });
+          req.on('error', reject);
+          req.on('timeout', () => {
+            req.destroy(new Error(`Timeout connecting to ${parsed.hostname} (${ip})`));
+          });
+          if (options.body) {
+            req.write(options.body);
+          }
+          req.end();
         });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => {
-        req.destroy(new Error(`Timeout connecting to ${parsed.hostname} (${ip})`));
-      });
-      if (options.body) {
-        req.write(options.body);
+        return result;
+      } catch (tryErr) {
+        lastErr = tryErr;
       }
-      req.end();
-    });
+    }
+    throw lastErr;
   }
 }
 
@@ -4353,7 +4361,12 @@ async function main() {
       `${publicBase}/healthz`,
       token,
       verboseLogs,
-      20000
+      20000,
+      () => {
+        try {
+          spawnSyncPortable(tailscalePath, ['debug', 'force-netmap-update'], { stdio: 'ignore', timeout: 3000 });
+        } catch {}
+      }
     );
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
       localBase,
