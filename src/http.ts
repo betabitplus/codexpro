@@ -1435,6 +1435,39 @@ function onboardingPage(config: CodexProConfig): string {
 </html>`;
 }
 
+const logDir = path.join(codexProHome(), "logs");
+const logFilePath = path.join(logDir, "codexpro.log");
+const MAX_LOG_SIZE = 10 * 1024 * 1024; // 10MB
+
+function rotateLogIfNeeded(): void {
+  try {
+    if (!fs.existsSync(logFilePath)) return;
+    const stats = fs.statSync(logFilePath);
+    if (stats.size > MAX_LOG_SIZE) {
+      const backup2 = `${logFilePath}.2`;
+      const backup1 = `${logFilePath}.1`;
+      if (fs.existsSync(backup1)) {
+        try { fs.renameSync(backup1, backup2); } catch {}
+      }
+      try { fs.renameSync(logFilePath, backup1); } catch {}
+    }
+  } catch {}
+}
+
+let logStream: fs.WriteStream | null = null;
+export function writeDiskLog(category: string, message: string): void {
+  try {
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    rotateLogIfNeeded();
+    if (!logStream || logStream.destroyed) {
+      logStream = fs.createWriteStream(logFilePath, { flags: "a" });
+      logStream.on("error", () => { logStream = null; });
+    }
+    const iso = new Date().toISOString();
+    logStream.write(`[${iso}] [${category}] ${message}\n`);
+  } catch {}
+}
+
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function loadKnownSessions(): Set<string> {
@@ -1442,19 +1475,38 @@ function loadKnownSessions(): Set<string> {
     const file = path.join(codexProHome(), "sessions.json");
     if (fs.existsSync(file)) {
       const data = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (Array.isArray(data)) return new Set(data.filter((id) => typeof id === "string" && sessionIdPattern.test(id)));
+      if (Array.isArray(data)) {
+        const valid = data.filter((id) => typeof id === "string" && sessionIdPattern.test(id)).slice(-2000);
+        return new Set(valid);
+      }
     }
   } catch {}
   return new Set();
 }
 
+let persistTimer: NodeJS.Timeout | null = null;
 function persistKnownSessions(sessions: Set<string>): void {
-  try {
-    const dir = codexProHome();
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, "sessions.json");
-    fs.writeFileSync(file, JSON.stringify([...sessions].slice(-50000)), "utf8");
-  } catch {}
+  if (sessions.size > 2000) {
+    const keep = [...sessions].slice(-2000);
+    sessions.clear();
+    for (const id of keep) sessions.add(id);
+  }
+  if (persistTimer) return;
+  persistTimer = setTimeout(async () => {
+    persistTimer = null;
+    try {
+      const dir = codexProHome();
+      if (!fs.existsSync(dir)) await fs.promises.mkdir(dir, { recursive: true });
+      const file = path.join(dir, "sessions.json");
+      const tmpFile = path.join(dir, `sessions.json.tmp.${process.pid}`);
+      const data = JSON.stringify([...sessions].slice(-2000));
+      await fs.promises.writeFile(tmpFile, data, "utf8");
+      await fs.promises.rename(tmpFile, file);
+    } catch (err) {
+      writeDiskLog("sessions:error", `Failed to persist sessions: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, 1000);
+  persistTimer.unref();
 }
 
 async function main(): Promise<void> {
@@ -1545,15 +1597,27 @@ async function main(): Promise<void> {
   }
 
   app.use((req, res, next) => {
+    const started = Date.now();
+    const reqSession = requestSessionId(req) || "-";
+    const remote = req.ip || req.socket.remoteAddress || "local";
+    const logLineStart = `--> ${req.method} ${req.originalUrl || req.path} session=${reqSession} remote=${remote}`;
     if (logRequests) {
       console.error(`[CodexPro] ${req.method} ${req.path} received`);
     }
-    const started = Date.now();
+    writeDiskLog("http", logLineStart);
+
     res.on("finish", () => {
-      if (res.statusCode >= 400) {
-        console.error(`[CodexPro MCP] ${req.method} ${req.originalUrl || req.path} -> ${res.statusCode} (${Date.now() - started}ms)`);
-      } else if (logRequests) {
-        console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      const duration = Date.now() - started;
+      const status = res.statusCode;
+      const logLineEnd = `<-- ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms, session=${reqSession})`;
+      if (status >= 400) {
+        console.error(`[CodexPro MCP] ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms)`);
+        writeDiskLog("http:error", logLineEnd);
+      } else {
+        if (logRequests) {
+          console.error(`[CodexPro] ${req.method} ${req.path} -> ${status} ${duration}ms`);
+        }
+        writeDiskLog("http", logLineEnd);
       }
     });
     next();
@@ -1771,17 +1835,19 @@ async function main(): Promise<void> {
 
   const handleMcpPost = async (req: express.Request, res: express.Response) => {
     const started = Date.now();
+    const sessionId = requestSessionId(req);
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
     if (toolName) {
       console.log(`[CodexPro MCP] Calling tool: ${toolName}...`);
+      writeDiskLog("mcp", `Calling tool: ${toolName} session=${sessionId || "-"}`);
     } else if (bodyMethod === "initialize") {
       const clientName = (req.body as any).params?.clientInfo?.name ?? "client";
       console.log(`[CodexPro MCP] Client connected: ${clientName}`);
+      writeDiskLog("mcp", `Client connected: ${clientName} session=${sessionId || "-"}`);
     }
 
     try {
-      const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport | undefined;
 
       const existingTransport = await getOrCreateTransport(sessionId);
@@ -1820,10 +1886,14 @@ async function main(): Promise<void> {
 
       await transport.handleRequest(req, res, req.body);
       if (toolName) {
-        console.log(`[CodexPro MCP] Tool ${toolName} completed in ${Date.now() - started}ms`);
+        const duration = Date.now() - started;
+        console.log(`[CodexPro MCP] Tool ${toolName} completed in ${duration}ms`);
+        writeDiskLog("mcp", `Tool ${toolName} completed in ${duration}ms session=${sessionId || "-"}`);
       }
     } catch (error) {
-      console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+      const errMsg = error instanceof Error ? error.stack ?? error.message : String(error);
+      console.error(errMsg);
+      writeDiskLog("mcp:error", `handleMcpPost error: ${errMsg}`);
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: "2.0",
@@ -1905,8 +1975,10 @@ async function main(): Promise<void> {
   });
 
   // Prevent reverse proxy keep-alive race conditions (Tailscale Funnel, Cloudflare, etc.)
-  server.keepAliveTimeout = 65000;
-  server.headersTimeout = 66000;
+  // Tailscale and Go proxies have default IdleConnTimeout of 90-120 seconds.
+  // Setting keepAliveTimeout to 125s ensures the proxy always closes idle connections first.
+  server.keepAliveTimeout = 125000;
+  server.headersTimeout = 126000;
   server.requestTimeout = 0;
   server.timeout = 0;
 }

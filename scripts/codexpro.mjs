@@ -127,6 +127,7 @@ Options:
   --open-chatgpt            Open ChatGPT connector settings after the URL is ready.
   --headless                Run without prompts, clipboard, browser opening, or the control panel.
   --no-auth                 Disable bearer-token auth. Only allowed with --tunnel none.
+  logs                      View recent logs from ~/.codexpro/logs/codexpro.log.
   --log-requests            Print redacted HTTP request and tool-call logs from the local MCP server.
   connection-test           Start a read-only connector with request logging and no bash or tool cards.
   --print-env               Print the environment used to launch the server.
@@ -650,6 +651,34 @@ function runtimeDir() {
 
 function runtimeStatusPathForRoot(root) {
   return path.join(runtimeDir(), `${profileIdForRoot(root)}.json`);
+}
+
+function codexProLogDir() {
+  return path.join(codexProHome(), "logs");
+}
+
+function codexProLogPath() {
+  return path.join(codexProLogDir(), "codexpro.log");
+}
+
+function appendDiskLog(line) {
+  try {
+    const dir = codexProLogDir();
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const logPath = codexProLogPath();
+    const stats = fs.existsSync(logPath) ? fs.statSync(logPath) : null;
+    if (stats && stats.size > 10 * 1024 * 1024) {
+      try {
+        const backup1 = `${logPath}.1`;
+        const backup2 = `${logPath}.2`;
+        if (fs.existsSync(backup1)) fs.renameSync(backup1, backup2);
+        fs.renameSync(logPath, backup1);
+      } catch {}
+    }
+    const iso = new Date().toISOString();
+    const formatted = line.split(/\r?\n/).filter(Boolean).map((l) => `[${iso}] ${l}`).join("\n") + "\n";
+    fs.appendFileSync(logPath, formatted, "utf8");
+  } catch {}
 }
 
 function readJsonFile(filePath) {
@@ -1181,7 +1210,7 @@ function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, o
     const start = Date.now();
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6000);
+      const timeout = setTimeout(() => controller.abort(), 8000);
       const res = await fetchWithDnsFallback(url, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         signal: controller.signal
@@ -1189,23 +1218,30 @@ function startTunnelKeepAlive(url, token, verbose = false, intervalMs = 20000, o
       clearTimeout(timeout);
       const elapsed = Date.now() - start;
       if (res.ok) {
+        if (failCount > 0) {
+          appendDiskLog(`[tunnel-keepalive] Probe recovered after ${failCount} failure(s) (${elapsed}ms)`);
+        }
         failCount = 0;
         if (typeof onSuccess === 'function') onSuccess();
-        if (elapsed > 3500 && verbose) {
-          console.warn(`[tunnel-keepalive] High latency: ${elapsed}ms`);
+        if (elapsed > 3500) {
+          appendDiskLog(`[tunnel-keepalive] High latency probe: ${elapsed}ms`);
+          if (verbose) console.warn(`[tunnel-keepalive] High latency: ${elapsed}ms`);
         }
       } else {
         failCount++;
+        appendDiskLog(`[tunnel-keepalive] Warning: probe returned status ${res.status} in ${elapsed}ms (failCount=${failCount})`);
         if (verbose) console.warn(`[tunnel-keepalive] Warning: probe returned status ${res.status} in ${elapsed}ms`);
-        if (failCount >= 2 && typeof onFail === 'function') {
+        if (failCount >= 5 && typeof onFail === 'function') {
           onFail(`HTTP probe returned status ${res.status}`);
         }
       }
     } catch (err) {
       failCount++;
-      if (verbose) console.warn(`[tunnel-keepalive] Probe failed: ${err instanceof Error ? err.message : String(err)}`);
-      if (failCount >= 2 && typeof onFail === 'function') {
-        onFail(`Probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      appendDiskLog(`[tunnel-keepalive] Probe failed (failCount=${failCount}): ${errMsg}`);
+      if (verbose) console.warn(`[tunnel-keepalive] Probe failed: ${errMsg}`);
+      if (failCount >= 5 && typeof onFail === 'function') {
+        onFail(`Probe failed: ${errMsg}`);
       }
     } finally {
       inFlight = false;
@@ -1277,9 +1313,11 @@ function spawnLogged(name, command, args, options = {}) {
   const logLines = [];
   const record = (stream, chunk) => {
     const text = redactForLog(String(chunk));
-    logLines.push(...text.split(/\r?\n/).filter(Boolean).map((line) => `[${name}] ${line}`));
+    const lines = text.split(/\r?\n/).filter(Boolean).map((line) => `[${name}] ${line}`);
+    logLines.push(...lines);
     while (logLines.length > 120) logLines.shift();
     if (verbose) stream.write(`[${name}] ${text}`);
+    if (lines.length > 0) appendDiskLog(lines.join('\n'));
   };
   child.codexproLogTail = () => logLines.join('\n');
   spawnedChildren.add(child);
@@ -1287,6 +1325,7 @@ function spawnLogged(name, command, args, options = {}) {
   child.stderr.on('data', (chunk) => record(process.stderr, chunk));
   child.on('exit', (code, signal) => {
     spawnedChildren.delete(child);
+    appendDiskLog(`[${name}] exited code=${code} signal=${signal}`);
     if (verbose) console.error(`[${name}] exited code=${code} signal=${signal}`);
   });
   return child;
@@ -3012,9 +3051,60 @@ function printConnectorBlock(endpoint, token, options = {}) {
     console.log(`CODEXPRO_READY ${serverUrl}`);
   } else {
     console.log('Next: press Enter to open ChatGPT, paste the copied Server URL, choose Authentication: None.');
-    console.log('Keys: Enter open | c copy | o status | h help | q quit');
+    console.log('Keys: Enter open | c copy | o status | l logs | h help | q quit');
   }
   return { ...details, copied, opened, mode, toolMode: options.toolMode ?? 'standard' };
+}
+
+async function runLogs(rawArgs = []) {
+  const logPath = codexProLogPath();
+  console.log(paint('bold', `CodexPro Logs: ${logPath}`));
+  if (!fs.existsSync(logPath)) {
+    console.log("No log file found yet. Start CodexPro to generate logs.");
+    return;
+  }
+  let linesCount = 50;
+  let follow = false;
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === '-f' || arg === '--follow') {
+      follow = true;
+    } else if (arg === '-n' && rawArgs[i + 1]) {
+      linesCount = parseInt(rawArgs[++i], 10) || 50;
+    } else if (/^-n\d+$/.test(arg)) {
+      linesCount = parseInt(arg.slice(2), 10) || 50;
+    }
+  }
+
+  const content = fs.readFileSync(logPath, 'utf8');
+  const allLines = content.split(/\r?\n/).filter(Boolean);
+  const tailLines = allLines.slice(-linesCount);
+  for (const line of tailLines) {
+    console.log(line);
+  }
+
+  if (follow) {
+    console.log(paint('dim', '--- Following logs (Ctrl+C to exit) ---'));
+    let currentSize = fs.statSync(logPath).size;
+    const interval = setInterval(() => {
+      try {
+        if (!fs.existsSync(logPath)) return;
+        const newSize = fs.statSync(logPath).size;
+        if (newSize > currentSize) {
+          const stream = fs.createReadStream(logPath, { start: currentSize, end: newSize - 1 });
+          stream.on('data', (chunk) => process.stdout.write(chunk));
+          currentSize = newSize;
+        } else if (newSize < currentSize) {
+          currentSize = 0;
+        }
+      } catch {}
+    }, 500);
+    process.on('SIGINT', () => {
+      clearInterval(interval);
+      process.exit(0);
+    });
+    await new Promise(() => {});
+  }
 }
 
 function printControlHelp() {
@@ -3024,6 +3114,7 @@ function printControlHelp() {
   console.log('  c      copy Server URL again');
   console.log('  u      print Server URL only');
   console.log('  o      open local setup/status page');
+  console.log('  l      show recent logs');
   console.log('  p      print Create App fields');
   console.log('  m      print mode help');
   console.log('  h      show controls');
@@ -3885,7 +3976,7 @@ function runControlPanel(details, cleanup = cleanupChildren) {
   process.stdin.resume();
 
   return new Promise(() => {
-    process.stdin.on('data', (key) => {
+    process.stdin.on('data', async (key) => {
       if (key === '\u0003') {
         console.log('\nStopping CodexPro...');
         cleanup();
@@ -3902,6 +3993,10 @@ function runControlPanel(details, cleanup = cleanupChildren) {
         writeControlPrompt();
       } else if (normalized === 'u') {
         console.log(`\n${details.serverUrl}`);
+        writeControlPrompt();
+      } else if (normalized === 'l') {
+        console.log('');
+        await runLogs(['-n', '25']);
         writeControlPrompt();
       } else if (normalized === 'o') {
         if (!details.localStatusUrl) {
@@ -4014,6 +4109,10 @@ async function main() {
   }
   if (subcommand === 'doctor') {
     await runDoctor(argv.slice(1));
+    return;
+  }
+  if (subcommand === 'logs') {
+    await runLogs(argv.slice(1));
     return;
   }
   if (argv[0] === 'stable') {
@@ -4360,14 +4459,21 @@ async function main() {
       token,
       verboseLogs,
       20000,
-      () => {
+      (reason) => {
+        appendDiskLog(`[tunnel-watchdog] Keepalive probe failed 5 times (${reason}). Checking Tailscale Funnel status...`);
         try {
-          spawnSyncPortable(tailscalePath, ['debug', 'force-netmap-update'], { stdio: 'ignore', timeout: 3000 });
+          if (isTailscaleFunnelActive(tailscalePath, 8787)) {
+            appendDiskLog(`[tunnel-watchdog] Tailscale Funnel is already active in background daemon, skipping disruptive re-registration.`);
+            return;
+          }
+          appendDiskLog(`[tunnel-watchdog] Funnel daemon is inactive, re-enabling in background...`);
           const healArgs = ['funnel', '--bg', '--yes'];
           if (httpsPort !== '443') healArgs.push(`--https=${httpsPort}`);
           healArgs.push(localBase);
-          spawnSyncPortable(tailscalePath, healArgs, { stdio: 'ignore', timeout: 5000 });
-        } catch {}
+          spawn(tailscalePath, healArgs, { stdio: 'ignore', detached: true }).unref();
+        } catch (err) {
+          appendDiskLog(`[tunnel-watchdog] Failed to re-enable funnel: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     );
     const details = printConnectorBlock(`${publicBase}/mcp`, token, {
