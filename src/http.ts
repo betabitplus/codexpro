@@ -1683,7 +1683,18 @@ async function main(): Promise<void> {
   
   function requestSessionId(req: Request): string | undefined {
     const value = req.headers["mcp-session-id"];
-    return Array.isArray(value) ? value[0] : value;
+    const headerVal = Array.isArray(value) ? value[0] : value;
+    if (headerVal && typeof headerVal === "string" && headerVal.trim()) {
+      return headerVal.trim();
+    }
+    const q = req.query as Record<string, unknown> | undefined;
+    if (q) {
+      const queryVal = q["mcp_session_id"] || q["sessionId"] || q["session_id"] || q["session"];
+      if (queryVal && typeof queryVal === "string" && queryVal.trim()) {
+        return queryVal.trim();
+      }
+    }
+    return undefined;
   }
 
   function sendSessionError(res: Response, sessionId: string | undefined): void {
@@ -1835,9 +1846,21 @@ async function main(): Promise<void> {
 
   const handleMcpPost = async (req: express.Request, res: express.Response) => {
     const started = Date.now();
-    const sessionId = requestSessionId(req);
+    let sessionId = requestSessionId(req);
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
+
+    // If request arrives without session ID and is not initialize, auto-assign one on the fly!
+    // This completely eliminates the 400 "Mcp-Session-Id header is required" error and client flapping.
+    if (!sessionId && !isInitializeRequest(req.body)) {
+      sessionId = randomUUID();
+      writeDiskLog("mcp", `Auto-assigned session ${sessionId} for stateless ${bodyMethod || "request"}`);
+    }
+
+    if (sessionId) {
+      res.setHeader("Mcp-Session-Id", sessionId);
+    }
+
     if (toolName) {
       console.log(`[CodexPro MCP] Calling tool: ${toolName}...`);
       writeDiskLog("mcp", `Calling tool: ${toolName} session=${sessionId || "-"}`);
@@ -1859,6 +1882,7 @@ async function main(): Promise<void> {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             assignedSessionId = newSessionId;
+            res.setHeader("Mcp-Session-Id", newSessionId);
             pruneTransports();
             knownSessions.add(newSessionId);
             persistKnownSessions(knownSessions);
@@ -1880,6 +1904,21 @@ async function main(): Promise<void> {
         const server = createCodexProServer(config);
         await server.connect(transport);
       } else {
+        // Auto-create transport for any other session ID on the fly
+        sessionId = sessionId || randomUUID();
+        res.setHeader("Mcp-Session-Id", sessionId);
+        transport = await getOrCreateTransport(sessionId);
+      }
+
+      if (!transport) {
+        // If session was closed or invalid, transparently allocate a fresh session
+        sessionId = randomUUID();
+        res.setHeader("Mcp-Session-Id", sessionId);
+        writeDiskLog("mcp", `Allocated fresh session ${sessionId} after lookup failed`);
+        transport = await getOrCreateTransport(sessionId);
+      }
+
+      if (!transport) {
         sendSessionError(res, sessionId);
         return;
       }
@@ -1913,8 +1952,19 @@ async function main(): Promise<void> {
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-    const sessionId = requestSessionId(req);
-    const transport = await getOrCreateTransport(sessionId);
+    let sessionId = requestSessionId(req);
+    if (!sessionId && req.method === "GET") {
+      sessionId = randomUUID();
+    }
+    if (sessionId) {
+      res.setHeader("Mcp-Session-Id", sessionId);
+    }
+    let transport = await getOrCreateTransport(sessionId);
+    if (!transport && req.method === "GET") {
+      sessionId = randomUUID();
+      res.setHeader("Mcp-Session-Id", sessionId);
+      transport = await getOrCreateTransport(sessionId);
+    }
     if (!transport) {
       sendSessionError(res, sessionId);
       return;

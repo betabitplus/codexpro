@@ -1086,13 +1086,8 @@ async function fetchWithDnsFallback(url, options = {}) {
   try {
     return await fetch(url, options);
   } catch (err) {
-    const isDnsError = err && (
-      err.code === 'ENOTFOUND' ||
-      err.cause?.code === 'ENOTFOUND' ||
-      String(err.message || '').includes('ENOTFOUND') ||
-      String(err.cause?.message || '').includes('ENOTFOUND')
-    );
-    if (!isDnsError) throw err;
+    // Attempt direct IPv4 fallback for any fetch failure (e.g. IPv6 unreachability, ENOTFOUND, timeout)
+
     const parsed = new URL(url);
     const resolver = new dns.promises.Resolver();
     resolver.setServers(['1.1.1.1', '8.8.8.8']);
