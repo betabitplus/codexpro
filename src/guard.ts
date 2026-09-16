@@ -6,6 +6,7 @@ import path from "node:path";
 import { minimatch } from "minimatch";
 import type { CodexProConfig } from "./config.js";
 import { expandHome } from "./config.js";
+import { codexProHome, profileDir, runtimeDir } from "./profileStore.js";
 
 export interface Workspace {
   id: string;
@@ -135,6 +136,23 @@ export class WorkspaceManager {
     if (!workspace) {
       const configuredRoot = this.config.allowedRoots.find((allowedRoot) => workspaceIdForRoot(allowedRoot) === id);
       if (configuredRoot) return this.openWorkspace(configuredRoot, { select: false });
+    }
+    if (!workspace && id.startsWith("ws_")) {
+      const hash = id.slice(3);
+      for (const dir of [profileDir(), runtimeDir()]) {
+        const filePath = path.join(dir, `${hash}.json`);
+        if (fs.existsSync(filePath)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+            if (typeof data?.root === "string" && fs.existsSync(data.root)) {
+              const real = fs.realpathSync.native(path.resolve(data.root));
+              if (this.config.allowedRoots.some((allowedRoot) => isSubpath(real, allowedRoot))) {
+                return this.openWorkspace(real, { select: false });
+              }
+            }
+          } catch {}
+        }
+      }
     }
     if (!workspace) {
       throw new CodexProError(`Unknown workspace_id: ${id}. Call open_workspace first.`);

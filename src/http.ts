@@ -1768,9 +1768,7 @@ async function main(): Promise<void> {
           sessionIdGenerator: () => sessionId
         } as any);
         transport.onclose = () => {
-          if (sessionId) {
-            transports.delete(sessionId);
-          }
+          writeDiskLog("mcp", `Transport connection closed for session ${sessionId}`);
         };
         (transport as any)._webStandardTransport._initialized = true;
         (transport as any)._webStandardTransport.sessionId = sessionId;
@@ -1918,11 +1916,11 @@ async function main(): Promise<void> {
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
 
-    // If request arrives without session ID and is not initialize, auto-assign one on the fly!
-    // This completely eliminates the 400 "Mcp-Session-Id header is required" error and client flapping.
+    // If request arrives without session ID and is not initialize, use a persistent stateless session!
+    // This eliminates 400 Mcp-Session-Id required AND preserves workspace selection across stateless turns.
     if (!sessionId && !isInitializeRequest(req.body)) {
-      sessionId = randomUUID();
-      writeDiskLog("mcp", `Auto-assigned session ${sessionId} for stateless ${bodyMethod || "request"}`);
+      sessionId = "00000000-0000-4000-a000-000000000001";
+      writeDiskLog("mcp", `Using persistent session ${sessionId} for stateless ${bodyMethod || "request"}`);
     }
 
     if (sessionId) {
@@ -1930,9 +1928,12 @@ async function main(): Promise<void> {
       res.setHeader("Mcp-Session-Id", sessionId);
     }
 
+    const toolArgs = toolName && req.body && typeof req.body === "object" && (req.body as any).params && typeof (req.body as any).params === "object" && "arguments" in (req.body as any).params
+      ? JSON.stringify((req.body as any).params.arguments)
+      : "";
     if (toolName) {
-      console.log(`[CodexPro MCP] Calling tool: ${toolName}...`);
-      writeDiskLog("mcp", `Calling tool: ${toolName} session=${sessionId || "-"}`);
+      console.log(`[CodexPro MCP] Calling tool: ${toolName}... ${toolArgs.slice(0, 160)}`);
+      writeDiskLog("mcp", `Calling tool: ${toolName} session=${sessionId || "-"} args=${toolArgs.slice(0, 300)}`);
     } else if (bodyMethod === "initialize") {
       const clientName = (req.body as any).params?.clientInfo?.name ?? "client";
       console.log(`[CodexPro MCP] Client connected: ${clientName}`);
@@ -1966,9 +1967,7 @@ async function main(): Promise<void> {
         } as any);
         transport.onclose = () => {
           const sid = assignedSessionId || transport?.sessionId;
-          if (sid) {
-            transports.delete(sid);
-          }
+          writeDiskLog("mcp", `Transport connection closed for session ${sid}`);
         };
 
         const server = createCodexProServer(config);
@@ -2033,6 +2032,18 @@ async function main(): Promise<void> {
       transports.delete(sessionId);
       knownSessions.delete(sessionId);
       persistKnownSessions(knownSessions);
+    }
+    if (req.method === "GET") {
+      const webTransport = (transport as any)._webStandardTransport;
+      const streamId = webTransport?._standaloneSseStreamId || "_GET_stream";
+      if (webTransport?._streamMapping?.has(streamId)) {
+        writeDiskLog("mcp", `Cleaning up previous stale SSE stream for session ${sessionId}`);
+        const oldStream = webTransport._streamMapping.get(streamId);
+        try {
+          oldStream?.cleanup?.();
+        } catch {}
+        webTransport._streamMapping.delete(streamId);
+      }
     }
     await transport.handleRequest(req, res);
   };
