@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { CodexProConfig } from "./config.js";
-import { WorkspaceManager, PathGuard, CodexProError, type Workspace } from "./guard.js";
+import { WorkspaceManager, PathGuard, CodexProError, type Workspace, type WorkspaceManagerOptions } from "./guard.js";
 import { repoTree, readTextFile, writeTextFile, editTextFile, ensureAiBridge, withFileWriteLocks } from "./fsOps.js";
 import { viewWorkspaceImage } from "./imageOps.js";
 import { importAttachmentFile } from "./importOps.js";
@@ -965,8 +965,8 @@ const CHATGPT_EXPORT_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, d
 const BASH_ANNOTATIONS = { readOnlyHint: false, openWorldHint: true, destructiveHint: true, idempotentHint: false };
 const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false };
 
-export function createCodexProServer(config: CodexProConfig): McpServer {
-  const workspaces = new WorkspaceManager(config);
+export function createCodexProServer(config: CodexProConfig, options: WorkspaceManagerOptions = {}): McpServer {
+  const workspaces = new WorkspaceManager(config, options);
   const pathRulesGate = new PathRulesGate(workspaces);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);

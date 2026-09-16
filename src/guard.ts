@@ -59,13 +59,77 @@ function closestExistingParent(absPath: string): string {
   return current;
 }
 
+export interface WorkspaceManagerOptions {
+  clientName?: string;
+  sessionId?: string;
+  isolated?: boolean;
+}
+
 const sharedWorkspaces = new Map<string, Workspace>();
+
+function persistRuntimeWorkspace(workspace: Workspace): void {
+  try {
+    const dir = runtimeDir();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const hash = workspace.id.startsWith("ws_") ? workspace.id.slice(3) : workspace.id;
+    const filePath = path.join(dir, `${hash}.json`);
+    const payload = {
+      version: 1,
+      id: workspace.id,
+      root: workspace.root,
+      openedAt: workspace.openedAt,
+      updatedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  } catch {}
+}
+
+function persistActiveWorkspace(workspace: Workspace): void {
+  try {
+    const dir = runtimeDir();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const filePath = path.join(dir, "active_workspace.json");
+    const payload = {
+      version: 1,
+      id: workspace.id,
+      root: workspace.root,
+      updatedAt: new Date().toISOString()
+    };
+    fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  } catch {}
+}
+
+function readActiveWorkspace(): { id: string; root: string } | undefined {
+  try {
+    const filePath = path.join(runtimeDir(), "active_workspace.json");
+    if (!fs.existsSync(filePath)) return undefined;
+    const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (typeof data?.id === "string" && typeof data?.root === "string" && fs.existsSync(data.root)) {
+      return { id: data.id, root: data.root };
+    }
+  } catch {}
+  return undefined;
+}
+
+let sharedSelectedWorkspaceId: string | undefined = readActiveWorkspace()?.id;
 
 export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
   private selectedWorkspaceId?: string;
 
-  constructor(private readonly config: CodexProConfig) {}
+  constructor(
+    private readonly config: CodexProConfig,
+    private readonly options: WorkspaceManagerOptions = {}
+  ) {
+    if (!this.options.isolated) {
+      const active = sharedSelectedWorkspaceId
+        ? (sharedWorkspaces.get(sharedSelectedWorkspaceId) ?? readActiveWorkspace())
+        : readActiveWorkspace();
+      if (active && this.config.allowedRoots.some((allowedRoot) => isSubpath(active.root, allowedRoot))) {
+        this.selectedWorkspaceId = active.id;
+      }
+    }
+  }
 
   defaultWorkspace(): Workspace {
     const existing = [...this.workspaces.values()].find((workspace) => workspace.root === this.config.defaultRoot)
@@ -80,6 +144,10 @@ export class WorkspaceManager {
   selectDefaultWorkspace(): Workspace {
     const workspace = this.defaultWorkspace();
     this.selectedWorkspaceId = workspace.id;
+    if (!this.options.isolated) {
+      sharedSelectedWorkspaceId = workspace.id;
+      persistActiveWorkspace(workspace);
+    }
     return workspace;
   }
 
@@ -106,22 +174,59 @@ export class WorkspaceManager {
     if (existing) {
       this.workspaces.set(id, existing);
       sharedWorkspaces.set(id, existing);
-      if (options.select !== false) this.selectedWorkspaceId = existing.id;
+      if (options.select !== false) {
+        this.selectedWorkspaceId = existing.id;
+        if (!this.options.isolated) {
+          sharedSelectedWorkspaceId = existing.id;
+          persistActiveWorkspace(existing);
+        }
+      }
+      persistRuntimeWorkspace(existing);
       return existing;
     }
 
     const workspace = { id, root: realRoot, openedAt: new Date().toISOString() };
     this.workspaces.set(id, workspace);
     sharedWorkspaces.set(id, workspace);
-    if (options.select !== false) this.selectedWorkspaceId = id;
+    if (options.select !== false) {
+      this.selectedWorkspaceId = id;
+      if (!this.options.isolated) {
+        sharedSelectedWorkspaceId = id;
+        persistActiveWorkspace(workspace);
+      }
+    }
+    persistRuntimeWorkspace(workspace);
     return workspace;
   }
 
   getWorkspace(id?: string): Workspace {
     if (!id) {
       if (this.selectedWorkspaceId) {
-        const selected = this.workspaces.get(this.selectedWorkspaceId);
-        if (selected) return selected;
+        const selected = this.workspaces.get(this.selectedWorkspaceId) ?? sharedWorkspaces.get(this.selectedWorkspaceId);
+        if (selected && this.config.allowedRoots.some((allowedRoot) => isSubpath(selected.root, allowedRoot))) {
+          this.workspaces.set(selected.id, selected);
+          return selected;
+        }
+        try {
+          const loaded = this.getWorkspace(this.selectedWorkspaceId);
+          if (loaded) return loaded;
+        } catch {
+          this.selectedWorkspaceId = undefined;
+        }
+      }
+      if (!this.options.isolated) {
+        const active = sharedSelectedWorkspaceId
+          ? (sharedWorkspaces.get(sharedSelectedWorkspaceId) ?? readActiveWorkspace())
+          : readActiveWorkspace();
+        if (active && this.config.allowedRoots.some((allowedRoot) => isSubpath(active.root, allowedRoot))) {
+          try {
+            const activeWs = this.getWorkspace(active.id);
+            if (activeWs) {
+              this.selectedWorkspaceId = activeWs.id;
+              return activeWs;
+            }
+          } catch {}
+        }
       }
       return this.selectDefaultWorkspace();
     }
@@ -167,10 +272,12 @@ export class WorkspaceManager {
         combined.set(workspace.id, workspace);
       }
     }
-    for (const workspace of sharedWorkspaces.values()) {
-      if (this.config.allowedRoots.some((allowedRoot) => isSubpath(workspace.root, allowedRoot))) {
-        if (!combined.has(workspace.id)) {
-          combined.set(workspace.id, workspace);
+    if (!this.options.isolated) {
+      for (const workspace of sharedWorkspaces.values()) {
+        if (this.config.allowedRoots.some((allowedRoot) => isSubpath(workspace.root, allowedRoot))) {
+          if (!combined.has(workspace.id)) {
+            combined.set(workspace.id, workspace);
+          }
         }
       }
     }

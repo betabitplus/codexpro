@@ -524,7 +524,7 @@ export const toolCardWidgetHtml = String.raw`<!doctype html>
 
       applyHostTheme();
       renderPending();
-      fallbackTimer = window.setTimeout(renderUnavailable, 1200);
+      fallbackTimer = window.setTimeout(renderUnavailable, 45000);
       renderFromHost(window.openai?.toolOutput || window.openai?.toolResponseMetadata || window.openai?.toolResult || {});
       window.addEventListener("openai:set_globals", (event) => {
         const globals = event.detail?.globals || window.openai || {};

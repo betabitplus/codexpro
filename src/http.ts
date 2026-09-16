@@ -1740,10 +1740,12 @@ async function main(): Promise<void> {
     }
   }
 
+  const sessionClientNames = new Map<string, string>();
+  let lastKnownClientName: string | undefined;
   const closedSessions = new Set<string>();
   const inFlightTransports = new Map<string, Promise<StreamableHTTPServerTransport | undefined>>();
 
-  async function getOrCreateTransport(sessionId: string | undefined): Promise<StreamableHTTPServerTransport | undefined> {
+  async function getOrCreateTransport(sessionId: string | undefined, clientHint?: string): Promise<StreamableHTTPServerTransport | undefined> {
     if (
       !sessionId ||
       !sessionIdPattern.test(sessionId) ||
@@ -1773,7 +1775,9 @@ async function main(): Promise<void> {
         };
         (transport as any)._webStandardTransport._initialized = true;
         (transport as any)._webStandardTransport.sessionId = sessionId;
-        const server = createCodexProServer(config);
+        const clientName = clientHint || sessionClientNames.get(sessionId) || lastKnownClientName;
+        const isIsolated = process.env.CODEXPRO_ISOLATE_SESSIONS === "1" || Boolean(clientName && (clientName.includes("smoke") || clientName === "codexpro-http-smoke"));
+        const server = createCodexProServer(config, { clientName, sessionId, isolated: isIsolated });
         await server.connect(transport);
         knownSessions.add(sessionId);
         persistKnownSessions(knownSessions);
@@ -1917,6 +1921,18 @@ async function main(): Promise<void> {
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
 
+    let clientName = sessionClientNames.get(sessionId || "");
+    if (bodyMethod === "initialize") {
+      const initName = (req.body as any).params?.clientInfo?.name;
+      if (typeof initName === "string" && initName.trim()) {
+        clientName = initName.trim();
+        lastKnownClientName = clientName;
+        if (sessionId) {
+          sessionClientNames.set(sessionId, clientName);
+        }
+      }
+    }
+
     // If request arrives without session ID and is not initialize, use a persistent stateless session!
     // This eliminates 400 Mcp-Session-Id required AND preserves workspace selection across stateless turns.
     if (!sessionId && !isInitializeRequest(req.body)) {
@@ -1936,15 +1952,15 @@ async function main(): Promise<void> {
       console.log(`[CodexPro MCP] Calling tool: ${toolName}... ${toolArgs.slice(0, 160)}`);
       writeDiskLog("mcp", `Calling tool: ${toolName} session=${sessionId || "-"} args=${toolArgs.slice(0, 300)}`);
     } else if (bodyMethod === "initialize") {
-      const clientName = (req.body as any).params?.clientInfo?.name ?? "client";
-      console.log(`[CodexPro MCP] Client connected: ${clientName}`);
-      writeDiskLog("mcp", `Client connected: ${clientName} session=${sessionId || "-"}`);
+      const effectiveClient = clientName || "client";
+      console.log(`[CodexPro MCP] Client connected: ${effectiveClient}`);
+      writeDiskLog("mcp", `Client connected: ${effectiveClient} session=${sessionId || "-"}`);
     }
 
     try {
       let transport: StreamableHTTPServerTransport | undefined;
 
-      const existingTransport = await getOrCreateTransport(sessionId);
+      const existingTransport = await getOrCreateTransport(sessionId, clientName);
       if (existingTransport) {
         transport = existingTransport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
@@ -1956,6 +1972,9 @@ async function main(): Promise<void> {
             assignedSessionId = newSessionId;
             syncSessionHeader(req, newSessionId);
             res.setHeader("Mcp-Session-Id", newSessionId);
+            if (clientName) {
+              sessionClientNames.set(newSessionId, clientName);
+            }
             pruneTransports();
             knownSessions.add(newSessionId);
             persistKnownSessions(knownSessions);
@@ -1972,13 +1991,14 @@ async function main(): Promise<void> {
           writeDiskLog("mcp", `Transport connection closed for session ${sid}`);
         };
 
-        const server = createCodexProServer(config);
+        const isIsolated = process.env.CODEXPRO_ISOLATE_SESSIONS === "1" || Boolean(clientName && (clientName.includes("smoke") || clientName === "codexpro-http-smoke"));
+        const server = createCodexProServer(config, { clientName, sessionId: assignedSessionId, isolated: isIsolated });
         await server.connect(transport);
       } else {
         // Auto-create transport for any other session ID on the fly
         sessionId = sessionId || randomUUID();
         res.setHeader("Mcp-Session-Id", sessionId);
-        transport = await getOrCreateTransport(sessionId);
+        transport = await getOrCreateTransport(sessionId, clientName);
       }
 
       if (!transport) {
