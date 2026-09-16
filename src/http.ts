@@ -1933,11 +1933,10 @@ async function main(): Promise<void> {
       }
     }
 
-    // If request arrives without session ID and is not initialize, use a persistent stateless session!
-    // This eliminates 400 Mcp-Session-Id required AND preserves workspace selection across stateless turns.
-    if (!sessionId && !isInitializeRequest(req.body)) {
-      sessionId = "00000000-0000-4000-a000-000000000001";
-      writeDiskLog("mcp", `Using persistent session ${sessionId} for stateless ${bodyMethod || "request"}`);
+    const isStateless = !sessionId && !isInitializeRequest(req.body);
+    if (isStateless) {
+      sessionId = randomUUID();
+      writeDiskLog("mcp", `Using dedicated transport ${sessionId} for stateless ${bodyMethod || "request"}`);
     }
 
     if (sessionId) {
@@ -2006,11 +2005,18 @@ async function main(): Promise<void> {
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
-      if (toolName) {
-        const duration = Date.now() - started;
-        console.log(`[CodexPro MCP] Tool ${toolName} completed in ${duration}ms`);
-        writeDiskLog("mcp", `Tool ${toolName} completed in ${duration}ms session=${sessionId || "-"}`);
+      try {
+        await transport.handleRequest(req, res, req.body);
+        if (toolName) {
+          const duration = Date.now() - started;
+          console.log(`[CodexPro MCP] Tool ${toolName} completed in ${duration}ms`);
+          writeDiskLog("mcp", `Tool ${toolName} completed in ${duration}ms session=${sessionId || "-"}`);
+        }
+      } finally {
+        if (isStateless && sessionId) {
+          transports.delete(sessionId);
+          closedSessions.add(sessionId);
+        }
       }
     } catch (error) {
       const errMsg = error instanceof Error ? error.stack ?? error.message : String(error);
