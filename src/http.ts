@@ -1606,19 +1606,28 @@ async function main(): Promise<void> {
     }
     writeDiskLog("http", logLineStart);
 
-    res.on("finish", () => {
+    let logged = false;
+    const logDone = (closedAbruptly: boolean) => {
+      if (logged) return;
+      logged = true;
       const duration = Date.now() - started;
       const status = res.statusCode;
-      const logLineEnd = `<-- ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms, session=${reqSession})`;
+      const suffix = closedAbruptly ? " [client disconnected]" : "";
+      const logLineEnd = `<-- ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms, session=${reqSession})${suffix}`;
       if (status >= 400) {
-        console.error(`[CodexPro MCP] ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms)`);
+        console.error(`[CodexPro MCP] ${req.method} ${req.originalUrl || req.path} -> ${status} (${duration}ms)${suffix}`);
         writeDiskLog("http:error", logLineEnd);
       } else {
         if (logRequests) {
-          console.error(`[CodexPro] ${req.method} ${req.path} -> ${status} ${duration}ms`);
+          console.error(`[CodexPro] ${req.method} ${req.path} -> ${status} ${duration}ms${suffix}`);
         }
         writeDiskLog("http", logLineEnd);
       }
+    };
+
+    res.on("finish", () => logDone(false));
+    res.on("close", () => {
+      if (!res.writableEnded) logDone(true);
     });
     next();
   });
@@ -1857,6 +1866,13 @@ async function main(): Promise<void> {
       writeDiskLog("mcp", `Auto-assigned session ${sessionId} for stateless ${bodyMethod || "request"}`);
     }
 
+    const hasRawHeader = Array.isArray(req.rawHeaders) && req.rawHeaders.some((h, i) => i % 2 === 0 && h.toLowerCase() === "mcp-session-id");
+    if (sessionId && !hasRawHeader) {
+      req.headers["mcp-session-id"] = sessionId;
+      if (Array.isArray(req.rawHeaders)) {
+        req.rawHeaders.push("mcp-session-id", sessionId);
+      }
+    }
     if (sessionId) {
       res.setHeader("Mcp-Session-Id", sessionId);
     }
@@ -1955,6 +1971,13 @@ async function main(): Promise<void> {
     let sessionId = requestSessionId(req);
     if (!sessionId && req.method === "GET") {
       sessionId = randomUUID();
+    }
+    const hasRawHeader = Array.isArray(req.rawHeaders) && req.rawHeaders.some((h, i) => i % 2 === 0 && h.toLowerCase() === "mcp-session-id");
+    if (sessionId && !hasRawHeader) {
+      req.headers["mcp-session-id"] = sessionId;
+      if (Array.isArray(req.rawHeaders)) {
+        req.rawHeaders.push("mcp-session-id", sessionId);
+      }
     }
     if (sessionId) {
       res.setHeader("Mcp-Session-Id", sessionId);
