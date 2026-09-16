@@ -1765,7 +1765,8 @@ async function main(): Promise<void> {
       try {
         console.log(`[CodexPro MCP] Initializing/restoring session for ID: ${sessionId}`);
         const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => sessionId
+          sessionIdGenerator: () => sessionId,
+          enableJsonResponse: true
         } as any);
         transport.onclose = () => {
           writeDiskLog("mcp", `Transport connection closed for session ${sessionId}`);
@@ -1950,6 +1951,7 @@ async function main(): Promise<void> {
         let assignedSessionId = "";
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
           onsessioninitialized: (newSessionId: string) => {
             assignedSessionId = newSessionId;
             syncSessionHeader(req, newSessionId);
