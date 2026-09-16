@@ -1853,8 +1853,67 @@ async function main(): Promise<void> {
     jsonError(res, 405, "method_not_allowed", "Use GET or POST for /admin/profile.");
   });
 
+  function normalizeMcpHeaders(req: express.Request): void {
+    const accept = String(req.headers["accept"] || "");
+    if (req.method === "POST") {
+      if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
+        const normalized = accept ? `${accept}, application/json, text/event-stream` : "application/json, text/event-stream";
+        req.headers["accept"] = normalized;
+        if (Array.isArray(req.rawHeaders)) {
+          let found = false;
+          for (let i = 0; i < req.rawHeaders.length; i += 2) {
+            if (req.rawHeaders[i].toLowerCase() === "accept") {
+              req.rawHeaders[i + 1] = normalized;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            req.rawHeaders.push("accept", normalized);
+          }
+        }
+      }
+    } else if (req.method === "GET") {
+      if (!accept.includes("text/event-stream")) {
+        const normalized = accept ? `${accept}, text/event-stream` : "text/event-stream";
+        req.headers["accept"] = normalized;
+        if (Array.isArray(req.rawHeaders)) {
+          let found = false;
+          for (let i = 0; i < req.rawHeaders.length; i += 2) {
+            if (req.rawHeaders[i].toLowerCase() === "accept") {
+              req.rawHeaders[i + 1] = normalized;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            req.rawHeaders.push("accept", normalized);
+          }
+        }
+      }
+    }
+  }
+
+  function syncSessionHeader(req: express.Request, sessionId: string): void {
+    req.headers["mcp-session-id"] = sessionId;
+    if (Array.isArray(req.rawHeaders)) {
+      let found = false;
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        if (req.rawHeaders[i].toLowerCase() === "mcp-session-id") {
+          req.rawHeaders[i + 1] = sessionId;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        req.rawHeaders.push("mcp-session-id", sessionId);
+      }
+    }
+  }
+
   const handleMcpPost = async (req: express.Request, res: express.Response) => {
     const started = Date.now();
+    normalizeMcpHeaders(req);
     let sessionId = requestSessionId(req);
     const bodyMethod = req.body && typeof req.body === "object" && "method" in req.body ? String((req.body as any).method) : "";
     const toolName = bodyMethod === "tools/call" && req.body.params && typeof req.body.params === "object" && "name" in req.body.params ? String((req.body.params as any).name) : "";
@@ -1866,14 +1925,8 @@ async function main(): Promise<void> {
       writeDiskLog("mcp", `Auto-assigned session ${sessionId} for stateless ${bodyMethod || "request"}`);
     }
 
-    const hasRawHeader = Array.isArray(req.rawHeaders) && req.rawHeaders.some((h, i) => i % 2 === 0 && h.toLowerCase() === "mcp-session-id");
-    if (sessionId && !hasRawHeader) {
-      req.headers["mcp-session-id"] = sessionId;
-      if (Array.isArray(req.rawHeaders)) {
-        req.rawHeaders.push("mcp-session-id", sessionId);
-      }
-    }
     if (sessionId) {
+      syncSessionHeader(req, sessionId);
       res.setHeader("Mcp-Session-Id", sessionId);
     }
 
@@ -1898,6 +1951,7 @@ async function main(): Promise<void> {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             assignedSessionId = newSessionId;
+            syncSessionHeader(req, newSessionId);
             res.setHeader("Mcp-Session-Id", newSessionId);
             pruneTransports();
             knownSessions.add(newSessionId);
@@ -1923,14 +1977,6 @@ async function main(): Promise<void> {
         // Auto-create transport for any other session ID on the fly
         sessionId = sessionId || randomUUID();
         res.setHeader("Mcp-Session-Id", sessionId);
-        transport = await getOrCreateTransport(sessionId);
-      }
-
-      if (!transport) {
-        // If session was closed or invalid, transparently allocate a fresh session
-        sessionId = randomUUID();
-        res.setHeader("Mcp-Session-Id", sessionId);
-        writeDiskLog("mcp", `Allocated fresh session ${sessionId} after lookup failed`);
         transport = await getOrCreateTransport(sessionId);
       }
 
@@ -1968,26 +2014,16 @@ async function main(): Promise<void> {
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
+    normalizeMcpHeaders(req);
     let sessionId = requestSessionId(req);
     if (!sessionId && req.method === "GET") {
       sessionId = randomUUID();
     }
-    const hasRawHeader = Array.isArray(req.rawHeaders) && req.rawHeaders.some((h, i) => i % 2 === 0 && h.toLowerCase() === "mcp-session-id");
-    if (sessionId && !hasRawHeader) {
-      req.headers["mcp-session-id"] = sessionId;
-      if (Array.isArray(req.rawHeaders)) {
-        req.rawHeaders.push("mcp-session-id", sessionId);
-      }
-    }
     if (sessionId) {
+      syncSessionHeader(req, sessionId);
       res.setHeader("Mcp-Session-Id", sessionId);
     }
-    let transport = await getOrCreateTransport(sessionId);
-    if (!transport && req.method === "GET") {
-      sessionId = randomUUID();
-      res.setHeader("Mcp-Session-Id", sessionId);
-      transport = await getOrCreateTransport(sessionId);
-    }
+    const transport = await getOrCreateTransport(sessionId);
     if (!transport) {
       sendSessionError(res, sessionId);
       return;
