@@ -4,7 +4,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { codexProHome } from "./profileStore.js";
 
 const JOURNAL_FILENAME = "tool-activity.jsonl";
-const MAX_JOURNAL_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_JOURNAL_BYTES = 50 * 1024 * 1024;
+const MAX_JOURNAL_BACKUPS = 4;
+const SERVER_INSTANCE_ID = randomUUID();
+const PROCESS_STARTED_AT_MS = Date.now();
 
 type JsonObject = Record<string, unknown>;
 
@@ -64,6 +67,35 @@ function isCorrelationName(value: string): boolean {
   const name = normalizedName(value);
   if (isSensitiveName(name)) return false;
   return /(openai|oai|chatgpt|conversation|turn|invocation|request|trace|correlation|session)/i.test(name);
+}
+
+function argumentShape(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "depth-limit";
+  if (value === null || value === undefined) return "null";
+  if (Array.isArray(value)) {
+    return {
+      type: "array",
+      length: value.length,
+      items: value.slice(0, 16).map((item) => argumentShape(item, depth + 1))
+    };
+  }
+  if (typeof value === "object") {
+    const out: JsonObject = {};
+    for (const key of Object.keys(value as JsonObject).sort()) {
+      out[key] = argumentShape((value as JsonObject)[key], depth + 1);
+    }
+    return out;
+  }
+  if (typeof value === "string") return { type: "string", length: value.length };
+  return typeof value;
+}
+
+function instanceEvidence(): JsonObject {
+  return {
+    server_instance_id: SERVER_INSTANCE_ID,
+    server_pid: process.pid,
+    process_started_at_ms: PROCESS_STARTED_AT_MS
+  };
 }
 
 function scalarValue(value: unknown): string | number | boolean | null | undefined {
@@ -131,22 +163,41 @@ export function activityJournalPath(): string {
   return path.join(codexProHome(), "logs", JOURNAL_FILENAME);
 }
 
+function journalGloballyEnabled(): boolean {
+  return process.env.CODEXPRO_CORRELATION_JOURNAL?.trim().toLowerCase() !== "off";
+}
+
 function journalEnabled(extra?: CorrelationExtra): boolean {
-  if (process.env.CODEXPRO_CORRELATION_JOURNAL?.trim().toLowerCase() === "off") return false;
-  return Boolean(extra?.requestInfo);
+  return journalGloballyEnabled() && Boolean(extra?.requestInfo);
+}
+
+function journalMaxBytes(): number {
+  const raw = process.env.CODEXPRO_CORRELATION_MAX_BYTES?.trim();
+  if (!raw) return DEFAULT_MAX_JOURNAL_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_JOURNAL_BYTES;
+  return Math.min(1024 * 1024 * 1024, Math.max(1024 * 1024, Math.round(parsed)));
 }
 
 function rotateJournalIfNeeded(filePath: string): void {
   try {
     const stat = fs.statSync(filePath);
-    if (stat.size < MAX_JOURNAL_BYTES) return;
-    const rotated = filePath + ".1";
+    if (stat.size < journalMaxBytes()) return;
     try {
-      fs.rmSync(rotated, { force: true });
+      fs.rmSync(filePath + "." + MAX_JOURNAL_BACKUPS, { force: true });
     } catch {
       // best-effort rotation only
     }
-    fs.renameSync(filePath, rotated);
+    for (let index = MAX_JOURNAL_BACKUPS - 1; index >= 1; index -= 1) {
+      const from = filePath + "." + index;
+      const to = filePath + "." + (index + 1);
+      try {
+        fs.renameSync(from, to);
+      } catch {
+        // rotated generation may not exist yet
+      }
+    }
+    fs.renameSync(filePath, filePath + ".1");
   } catch {
     // file absent or unavailable; append path will handle the rest
   }
@@ -162,6 +213,17 @@ function appendRecord(record: JsonObject): void {
   } catch {
     // Observability must never break a tool call.
   }
+}
+
+export function recordServerStart(details: JsonObject = {}): void {
+  if (!journalGloballyEnabled()) return;
+  appendRecord({
+    schema: 1,
+    event: "server_start",
+    observed_at_ms: Date.now(),
+    ...instanceEvidence(),
+    ...details
+  });
 }
 
 function workspaceIdFromArgs(args: unknown): string | null {
@@ -188,14 +250,19 @@ export function beginToolActivity(tool: string, args: unknown, extra?: Correlati
     tool,
     workspaceId: workspaceIdFromArgs(args)
   };
+  const normalizedArgs = args ?? {};
+  const canonicalArgs = stableJson(normalizedArgs);
   appendRecord({
     schema: 1,
     event: "tool_start",
     activity_id: handle.id,
     observed_at_ms: startedAt,
+    ...instanceEvidence(),
     tool,
     workspace_id: handle.workspaceId,
-    args_sha256: sha256Fingerprint(args ?? {}),
+    args_sha256: sha256Fingerprint(normalizedArgs),
+    args_canonical_bytes: Buffer.byteLength(canonicalArgs, "utf8"),
+    args_shape: argumentShape(normalizedArgs),
     ...correlationEvidence(extra)
   });
 
@@ -208,6 +275,7 @@ export function beginToolActivity(tool: string, args: unknown, extra?: Correlati
         event: "tool_heartbeat",
         activity_id: handle.id,
         observed_at_ms: observedAt,
+        ...instanceEvidence(),
         elapsed_ms: Math.max(0, observedAt - handle.startedAt),
         tool: handle.tool,
         workspace_id: handle.workspaceId
@@ -228,6 +296,7 @@ export function finishToolActivity(handle: ToolActivityHandle | null, outcome: "
     event: "tool_finish",
     activity_id: handle.id,
     observed_at_ms: finishedAt,
+    ...instanceEvidence(),
     duration_ms: Math.max(0, finishedAt - handle.startedAt),
     tool: handle.tool,
     workspace_id: handle.workspaceId,

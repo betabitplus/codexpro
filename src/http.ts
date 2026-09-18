@@ -22,6 +22,7 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { recordServerStart } from "./correlation.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -2114,6 +2115,18 @@ async function main(): Promise<void> {
   });
 
   const server = app.listen(config.port, config.host, () => {
+    recordServerStart({
+      host: config.host,
+      port: config.port,
+      default_root: config.defaultRoot,
+      allowed_roots: config.allowedRoots,
+      bash_mode: config.bashMode,
+      bash_transcript: config.bashTranscript,
+      write_mode: config.writeMode,
+      tool_mode: config.toolMode,
+      tool_cards: config.toolCards,
+      codex_sessions: config.codexSessions
+    });
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);
     console.error(`[CodexPro] defaultRoot=${config.defaultRoot}`);
     console.error(`[CodexPro] allowedRoots=${config.allowedRoots.join(", ")}`);

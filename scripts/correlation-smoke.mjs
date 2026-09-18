@@ -118,7 +118,22 @@ async function directRecorderSmoke(tempDir) {
   const records = await readJsonl(journal);
   const start = records.find((record) => record.event === "tool_start");
   assert.ok(start);
+  assert.ok(start.server_instance_id);
+  assert.equal(typeof start.server_pid, "number");
+  assert.equal(typeof start.process_started_at_ms, "number");
   assert.equal(start.workspace_id, "ws_direct");
+  assert.ok(start.args_canonical_bytes > 0);
+  assert.deepEqual(start.args_shape, {
+    a: "number",
+    workspace_id: { type: "string", length: 9 },
+    z: "number"
+  });
+  const lifecycle = records.filter((record) => record.activity_id === handle.id);
+  assert.ok(lifecycle.length >= 4);
+  assert.ok(
+    lifecycle.every((record) => record.server_instance_id === start.server_instance_id),
+    "tool lifecycle must remain on one server instance"
+  );
   assert.equal(start.header_fingerprints["x-openai-session-id"], sha256Fingerprint(rawOaiSession));
   assert.equal(start.header_fingerprints["x-request-id"], sha256Fingerprint(rawRequestId));
   assert.equal(start.header_fingerprints.authorization, undefined);
@@ -247,10 +262,24 @@ async function httpCanarySmoke(tempDir) {
     }
 
     const records = await readJsonl(journal);
+    const serverStarts = records.filter((record) => record.event === "server_start");
+    assert.equal(serverStarts.length, 1);
+    assert.ok(serverStarts[0].server_instance_id);
+    assert.equal(serverStarts[0].port, port);
+    assert.equal(serverStarts[0].bash_mode, "off");
+    assert.equal(serverStarts[0].write_mode, "off");
+    assert.equal(serverStarts[0].tool_mode, "minimal");
+
     const starts = records.filter(
       (record) => record.event === "tool_start" && record.tool === "open_current_workspace"
     );
     assert.equal(starts.length, 8);
+    assert.ok(
+      starts.every((record) => record.server_instance_id === serverStarts[0].server_instance_id),
+      "all tool calls must be attributed to the HTTP server instance"
+    );
+    assert.ok(starts.every((record) => record.args_canonical_bytes > 0));
+    assert.deepEqual(starts[0].args_shape, { include_tree: "boolean" });
     const observedSessionFingerprints = new Set(
       starts.map((record) => record.header_fingerprints["x-openai-session-id"])
     );
