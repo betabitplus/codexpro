@@ -21,6 +21,7 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { exportChatGPTChats } from "./chatgptExportOps.js";
 import { PATH_RULES_PROOF_FIELD, PathRuleActivationError, PathRulesGate, pathRulesApplyToTool } from "./pathRules.js";
+import { beginToolActivity, finishToolActivity } from "./correlation.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -303,12 +304,16 @@ function registerToolCompat(
 ): void {
   const wrapped = async (args: any, extra?: any) => {
     const started = Date.now();
+    const activity = beginToolActivity(name, args ?? {}, extra);
     try {
       const result = tagToolResult(await handler(args ?? {}, extra), name, options);
-      logToolCall(name, result?.isError ? "error" : "ok", started);
+      const outcome = result?.isError ? "error" : "ok";
+      finishToolActivity(activity, outcome);
+      logToolCall(name, outcome, started);
       return result;
     } catch (error) {
       const result = tagToolResult(errorResult(error), name, options);
+      finishToolActivity(activity, "error");
       logToolCall(name, "error", started);
       return result;
     }
