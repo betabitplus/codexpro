@@ -184,6 +184,35 @@ try {
         JSON.stringify(wrappedResolve.structuredContent)
     );
   }
+  const structuredBlocks = wrappedResolve.structuredContent?.deliveries?.[0]?.content_blocks;
+  if (
+    !Array.isArray(structuredBlocks) ||
+    structuredBlocks.length < 2 ||
+    !structuredBlocks.join('\n').includes('ATOMIC_CONTEXT_END_SENTINEL')
+  ) {
+    throw new Error(
+      'structured resolver delivery is incomplete: ' +
+        JSON.stringify(wrappedResolve.structuredContent?.deliveries?.[0])
+    );
+  }
+
+  const wrappedResolveUrlAlias = await client.request('tools/call', {
+    name: 'codexpro',
+    arguments: { action: 'resolve_chatgpt_context', args: { url: chat } }
+  });
+  if (wrappedResolveUrlAlias.isError) {
+    throw new Error(
+      'supertool args.url resolver alias failed: ' + JSON.stringify(wrappedResolveUrlAlias)
+    );
+  }
+  const aliasBlocks =
+    wrappedResolveUrlAlias.structuredContent?.deliveries?.[0]?.content_blocks;
+  if (
+    !Array.isArray(aliasBlocks) ||
+    !aliasBlocks.join('\n').includes('ATOMIC_CONTEXT_END_SENTINEL')
+  ) {
+    throw new Error('supertool args.url alias did not return the complete structured context');
+  }
 
   const call = await client.request('tools/call', {
     name: 'resolve_chatgpt_context',

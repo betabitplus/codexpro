@@ -307,6 +307,19 @@ function normalizeSupertoolAction(value: unknown): string {
   return SUPERTOOL_ACTION_ALIASES[normalized] ?? normalized;
 }
 
+function normalizedChatRefs(...values: unknown[]): string[] {
+  const refs: string[] = [];
+  for (const value of values) {
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      if (typeof item !== "string") continue;
+      const trimmed = item.trim();
+      if (trimmed && !refs.includes(trimmed)) refs.push(trimmed);
+    }
+  }
+  return refs;
+}
+
 
 function isContextPath(config: CodexProConfig, relPath: string): boolean {
   const normalized = relPath.split(path.sep).join("/").replace(/^\.\//, "");
@@ -572,7 +585,7 @@ function serverInstructions(config: CodexProConfig): string {
     editInstruction,
     bashInstruction,
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
-    "When the user supplies one or more private https://chatgpt.com/c/... conversation links as context to read, inspect, compare, recover, or continue prior work, use resolve_chatgpt_context first. It reconciles the local gptty TUI ledger with a fresh canonical web snapshot and atomically returns the complete resolved context in numbered content blocks in that same tool call. Treat the chat as read only after all declared blocks and the DELIVERY COMPLETE receipt are present; do not ask the user to trigger pagination. Use read_chatgpt_context only for explicit diagnostics/random access, and use export_chatgpt_chats directly only when the user explicitly wants the canonical web export itself or remote-only diagnostics.",
+    "When the user supplies one or more private https://chatgpt.com/c/... conversation links as context to read, inspect, compare, recover, or continue prior work, use resolve_chatgpt_context first. It reconciles the local gptty TUI ledger with a fresh canonical web snapshot and atomically returns the complete resolved context in that same tool call, both as MCP text blocks and as structuredContent.deliveries[].content_blocks. Treat the chat as read only after the delivery is complete; do not call read_chatgpt_context after a successful complete resolver delivery and do not ask the user to trigger pagination. Use read_chatgpt_context only for explicit diagnostics/random access, and use export_chatgpt_chats directly only when the user explicitly wants the canonical web export itself or remote-only diagnostics.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -1026,9 +1039,13 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
         "Stable wrapper for advanced ChatGPT connector setups. Pass action plus args to call an already-registered CodexPro tool. For ChatGPT conversation actions, pass the conversation URL/UUID directly as chat (or chats for multiple); CodexPro normalizes that shorthand into the wrapped tool arguments so the model does not need to know the nested envelope.",
       inputSchema: {
         action: z.string().optional().describe("Action or registered tool name. Use list_actions to see what this server mode allows."),
-        args: z.record(z.any()).optional().describe("Arguments for the selected action. Same shape as the wrapped CodexPro tool."),
+        args: z.record(z.any()).optional().describe("Arguments for the selected action. Same shape as the wrapped CodexPro tool; ChatGPT URL aliases url/urls/ref/refs inside args are normalized automatically."),
         chat: z.string().min(1).optional().describe("Shorthand private ChatGPT URL/UUID for resolve_chatgpt_context, read_chatgpt_context, or export_chatgpt_chats."),
-        chats: z.array(z.string().min(1)).min(1).max(20).optional().describe("Shorthand private ChatGPT URLs/UUIDs for resolve_chatgpt_context or export_chatgpt_chats.")
+        chats: z.array(z.string().min(1)).min(1).max(20).optional().describe("Shorthand private ChatGPT URLs/UUIDs for resolve_chatgpt_context or export_chatgpt_chats."),
+        url: z.string().min(1).optional().describe("Alias of chat for ChatGPT conversation actions."),
+        urls: z.array(z.string().min(1)).min(1).max(20).optional().describe("Alias of chats for ChatGPT conversation actions."),
+        ref: z.string().min(1).optional().describe("Alias of chat for ChatGPT conversation actions."),
+        refs: z.array(z.string().min(1)).min(1).max(20).optional().describe("Alias of chats for ChatGPT conversation actions.")
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
@@ -1083,25 +1100,28 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
           ? { ...args.args }
           : {};
 
+      const chatRefs = normalizedChatRefs(
+        childArgs.chats,
+        childArgs.chat,
+        childArgs.urls,
+        childArgs.url,
+        childArgs.refs,
+        childArgs.ref,
+        args.chats,
+        args.chat,
+        args.urls,
+        args.url,
+        args.refs,
+        args.ref
+      );
+
       if (action === "resolve_chatgpt_context" || action === "export_chatgpt_chats") {
         if (!Array.isArray(childArgs.chats) || childArgs.chats.length === 0) {
-          if (Array.isArray(args.chats) && args.chats.length) {
-            childArgs.chats = args.chats;
-          } else if (typeof args.chat === "string" && args.chat.trim()) {
-            childArgs.chats = [args.chat.trim()];
-          } else if (typeof childArgs.chat === "string" && childArgs.chat.trim()) {
-            childArgs.chats = [childArgs.chat.trim()];
-          }
+          if (chatRefs.length) childArgs.chats = chatRefs;
         }
       } else if (action === "read_chatgpt_context") {
         if (typeof childArgs.chat !== "string" || !childArgs.chat.trim()) {
-          if (typeof args.chat === "string" && args.chat.trim()) {
-            childArgs.chat = args.chat.trim();
-          } else if (Array.isArray(args.chats) && args.chats.length) {
-            childArgs.chat = String(args.chats[0]);
-          } else if (Array.isArray(childArgs.chats) && childArgs.chats.length) {
-            childArgs.chat = String(childArgs.chats[0]);
-          }
+          if (chatRefs.length) childArgs.chat = chatRefs[0];
         }
       }
 
@@ -1183,7 +1203,7 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
     {
       title: "Resolve ChatGPT Context",
       description:
-        "Default tool for private ChatGPT conversation URLs/IDs supplied as context. Read the local gptty TUI ledger and a fresh canonical ChatGPT web snapshot, reconcile differences without deleting local-only observations, preserve web branches, and atomically return the complete resolved context in numbered content blocks in this same tool call. Use this before export_chatgpt_chats when the user says to read, inspect, continue, compare, or recover a ChatGPT chat.",
+        "Default tool for private ChatGPT conversation URLs/IDs supplied as context. Read the local gptty TUI ledger and a fresh canonical ChatGPT web snapshot, reconcile differences without deleting local-only observations, preserve web branches, and atomically return the complete resolved context in this same tool call as both MCP text blocks and structuredContent.deliveries[].content_blocks. A successful complete delivery already means the chat content has been delivered; do not follow it with read_chatgpt_context unless the user explicitly asks for diagnostic/random-access reading.",
       inputSchema: {
         chats: z.array(z.string().min(1)).min(1).max(20).describe("Private https://chatgpt.com/c/<id> URLs or conversation UUIDs to resolve.")
       },
@@ -1285,6 +1305,7 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
         deliveries: deliveries.map(({ item, chunks, bytes, sha256 }) => ({
           conversation_id: item.conversation_id,
           blocks: chunks.length,
+          content_blocks: chunks,
           bytes,
           sha256,
           complete: true
