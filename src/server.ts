@@ -1023,10 +1023,12 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
     {
       title: "CodexPro Supertool",
       description:
-        "Stable wrapper for advanced ChatGPT connector setups. Pass action plus args to call an already-registered CodexPro tool without changing the visible schema; it cannot call tools disabled by the current mode.",
+        "Stable wrapper for advanced ChatGPT connector setups. Pass action plus args to call an already-registered CodexPro tool. For ChatGPT conversation actions, pass the conversation URL/UUID directly as chat (or chats for multiple); CodexPro normalizes that shorthand into the wrapped tool arguments so the model does not need to know the nested envelope.",
       inputSchema: {
         action: z.string().optional().describe("Action or registered tool name. Use list_actions to see what this server mode allows."),
-        args: z.record(z.any()).optional().describe("Arguments for the selected action. Same shape as the wrapped CodexPro tool.")
+        args: z.record(z.any()).optional().describe("Arguments for the selected action. Same shape as the wrapped CodexPro tool."),
+        chat: z.string().min(1).optional().describe("Shorthand private ChatGPT URL/UUID for resolve_chatgpt_context, read_chatgpt_context, or export_chatgpt_chats."),
+        chats: z.array(z.string().min(1)).min(1).max(20).optional().describe("Shorthand private ChatGPT URLs/UUIDs for resolve_chatgpt_context or export_chatgpt_chats.")
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
@@ -1076,10 +1078,33 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
         );
       }
 
-      const childArgs =
+      let childArgs =
         args.args && typeof args.args === "object" && !Array.isArray(args.args)
-          ? args.args
+          ? { ...args.args }
           : {};
+
+      if (action === "resolve_chatgpt_context" || action === "export_chatgpt_chats") {
+        if (!Array.isArray(childArgs.chats) || childArgs.chats.length === 0) {
+          if (Array.isArray(args.chats) && args.chats.length) {
+            childArgs.chats = args.chats;
+          } else if (typeof args.chat === "string" && args.chat.trim()) {
+            childArgs.chats = [args.chat.trim()];
+          } else if (typeof childArgs.chat === "string" && childArgs.chat.trim()) {
+            childArgs.chats = [childArgs.chat.trim()];
+          }
+        }
+      } else if (action === "read_chatgpt_context") {
+        if (typeof childArgs.chat !== "string" || !childArgs.chat.trim()) {
+          if (typeof args.chat === "string" && args.chat.trim()) {
+            childArgs.chat = args.chat.trim();
+          } else if (Array.isArray(args.chats) && args.chats.length) {
+            childArgs.chat = String(args.chats[0]);
+          } else if (Array.isArray(childArgs.chats) && childArgs.chats.length) {
+            childArgs.chat = String(childArgs.chats[0]);
+          }
+        }
+      }
+
       let result: any;
       try {
         result = await handler(childArgs, extra);

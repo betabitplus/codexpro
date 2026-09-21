@@ -164,6 +164,27 @@ try {
     throw new Error('supertool does not expose resolver: ' + JSON.stringify(wrapped.structuredContent));
   }
 
+  const wrappedResolve = await client.request('tools/call', {
+    name: 'codexpro',
+    arguments: { action: 'resolve_chatgpt_context', chat }
+  });
+  if (wrappedResolve.isError) {
+    throw new Error('supertool resolver shorthand failed: ' + JSON.stringify(wrappedResolve));
+  }
+  const wrappedText = (wrappedResolve.content || []).map((part) => part.text || '').join('\n');
+  if (
+    !wrappedText.includes('ATOMIC_CONTEXT_END_SENTINEL') ||
+    !wrappedText.includes('# DELIVERY COMPLETE · ' + conversationId)
+  ) {
+    throw new Error('supertool shorthand did not deliver complete reconciled context');
+  }
+  if (wrappedResolve.structuredContent?.codexpro_super_action !== 'resolve_chatgpt_context') {
+    throw new Error(
+      'supertool did not preserve wrapped resolver identity: ' +
+        JSON.stringify(wrappedResolve.structuredContent)
+    );
+  }
+
   const call = await client.request('tools/call', {
     name: 'resolve_chatgpt_context',
     arguments: { chats: [chat] }
