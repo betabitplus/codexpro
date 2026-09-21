@@ -70,13 +70,16 @@ With workspace write mode (the normal agent setup):
 - review diffs with `show_changes`
 - write plans under `.ai-bridge`
 - export a context bundle for chats that cannot call tools
-- export private ChatGPT conversation URLs to local Markdown with `export_chatgpt_chats`
+- resolve private ChatGPT conversation URLs against both the local gptty ledger and fresh web state with `resolve_chatgpt_context`
+- export canonical-web-only ChatGPT conversation Markdown with `export_chatgpt_chats`
 
 ### Private ChatGPT conversation links
 
-`export_chatgpt_chats` is an optional local integration. It expects the companion `chatgpt-exporter` CLI in `PATH`; CodexPro does not duplicate ChatGPT session or Markdown logic. The tool accepts one or more private `https://chatgpt.com/c/<id>` links (or conversation UUIDs), exports them through CWA, and returns absolute Markdown paths under `~/Documents/chatgpt-exports/`.
+`resolve_chatgpt_context` is the default integration when a private `https://chatgpt.com/c/<id>` link (or conversation UUID) is supplied as context to read, compare, recover, or continue prior work. It reads the append-only gptty `tui-observed` ledger when present, invokes the companion `chatgpt-exporter` for a fresh canonical web graph, reconciles `both` / `tui-only` / `web-only` observations without treating web absence as deletion, preserves visible branches, and returns the complete resolved Markdown atomically in numbered MCP content blocks in the same tool call.
 
-The companion exporter owns ChatGPT archive/index behavior and CWA owns browser/session canonical reads. CodexPro only invokes the installed CLI without a shell. If the exporter is not installed, the tool fails explicitly instead of falling back to web-page scraping.
+`export_chatgpt_chats` remains the explicit canonical-web-only snapshot/export path. It expects the companion `chatgpt-exporter` CLI in `PATH`; CodexPro does not duplicate ChatGPT browser/session or graph extraction logic. The exporter produces Markdown plus a compact visible-message `.context.json` sidecar under `~/Documents/chatgpt-exports/`.
+
+The companion exporter owns canonical web archive/index behavior, gptty owns the local TUI ledger, and CWA owns browser/session canonical reads. CodexPro performs reconciliation and delivery. If the exporter is unavailable, reconciliation may still retain an existing local TUI ledger and reports the web side as unavailable instead of pretending the sources agree.
 
 ## Multiple projects
 

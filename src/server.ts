@@ -20,6 +20,7 @@ import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidg
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { exportChatGPTChats } from "./chatgptExportOps.js";
+import { readResolvedChatGPTContext, resolveChatGPTContexts } from "./chatgptContextOps.js";
 import { PATH_RULES_PROOF_FIELD, PathRuleActivationError, PathRulesGate, pathRulesApplyToTool } from "./pathRules.js";
 import { beginToolActivity, finishToolActivity } from "./correlation.js";
 
@@ -52,6 +53,35 @@ function textResult(text: string, structuredContent: Record<string, unknown> = {
     structuredContent: redactStructured(structuredContent),
     _meta: meta
   };
+}
+
+function textBlocksResult(
+  blocks: string[],
+  structuredContent: Record<string, unknown> = {},
+  meta: Record<string, unknown> = {}
+): any {
+  if (!blocks.length) blocks = [""];
+  return {
+    content: blocks.map((text) => ({ type: "text", text: redactSensitiveText(text) })),
+    structuredContent: redactStructured(structuredContent),
+    _meta: meta
+  };
+}
+
+function splitTextBlocks(text: string, maxChars = 24_000): string[] {
+  if (!text) return [""];
+  const blocks: string[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    let end = Math.min(text.length, cursor + maxChars);
+    if (end < text.length) {
+      const newline = text.lastIndexOf("\n", end);
+      if (newline > cursor + Math.floor(maxChars * 0.6)) end = newline + 1;
+    }
+    blocks.push(text.slice(cursor, end));
+    cursor = end;
+  }
+  return blocks;
 }
 
 function countTextLines(value: string | undefined): number {
@@ -363,6 +393,8 @@ const STANDARD_TOOL_NAMES = [
   "inspect_workspace",
   "tree",
   "search",
+  "resolve_chatgpt_context",
+  "read_chatgpt_context",
   "export_chatgpt_chats",
   "load_skill",
   "view_image",
@@ -385,6 +417,8 @@ const FULL_TOOL_NAMES = [
   "inspect_workspace",
   "tree",
   "search",
+  "resolve_chatgpt_context",
+  "read_chatgpt_context",
   "export_chatgpt_chats",
   "read",
   "view_image",
@@ -412,6 +446,8 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "bash",
+  "resolve_chatgpt_context",
+  "read_chatgpt_context",
   "export_chatgpt_chats",
   "export_pro_context",
   "handoff_to_agent",
@@ -536,7 +572,7 @@ function serverInstructions(config: CodexProConfig): string {
     editInstruction,
     bashInstruction,
     "6. Keep tool calls minimal. Prefer one targeted search plus show_changes instead of repeated broad inspection calls.",
-    "When the user supplies one or more private https://chatgpt.com/c/... conversation links as context to inspect, compare, recover, or continue prior work, use export_chatgpt_chats to materialize the canonical Markdown first instead of trying to scrape the web page.",
+    "When the user supplies one or more private https://chatgpt.com/c/... conversation links as context to read, inspect, compare, recover, or continue prior work, use resolve_chatgpt_context first. It reconciles the local gptty TUI ledger with a fresh canonical web snapshot and atomically returns the complete resolved context in numbered content blocks in that same tool call. Treat the chat as read only after all declared blocks and the DELIVERY COMPLETE receipt are present; do not ask the user to trigger pagination. Use read_chatgpt_context only for explicit diagnostics/random access, and use export_chatgpt_chats directly only when the user explicitly wants the canonical web export itself or remote-only diagnostics.",
     config.codexSessions !== "off"
       ? `7. Codex session history access is enabled in ${config.codexSessions} mode. Use it only when the user asks for local Codex session history.`
       : "",
@@ -1118,11 +1154,166 @@ export function createCodexProServer(config: CodexProConfig, options: WorkspaceM
   registerCodexTool(
     config,
     server,
+    "resolve_chatgpt_context",
+    {
+      title: "Resolve ChatGPT Context",
+      description:
+        "Default tool for private ChatGPT conversation URLs/IDs supplied as context. Read the local gptty TUI ledger and a fresh canonical ChatGPT web snapshot, reconcile differences without deleting local-only observations, preserve web branches, and atomically return the complete resolved context in numbered content blocks in this same tool call. Use this before export_chatgpt_chats when the user says to read, inspect, continue, compare, or recover a ChatGPT chat.",
+      inputSchema: {
+        chats: z.array(z.string().min(1)).min(1).max(20).describe("Private https://chatgpt.com/c/<id> URLs or conversation UUIDs to resolve.")
+      },
+      annotations: CHATGPT_EXPORT_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Reconciling ChatGPT context...",
+        "openai/toolInvocation/invoked": "ChatGPT context reconciled"
+      }
+    },
+    async (args) => {
+      const result = await resolveChatGPTContexts({
+        chats: args.chats
+      });
+      const resolved = result.results.filter((item) => item.ok);
+      const failures = result.results.filter((item) => !item.ok);
+      const deliveries = await Promise.all(
+        resolved.map(async (item) => {
+          if (!item.resolved_context_path) {
+            throw new CodexProError(
+              `Resolved context path is missing for ${item.conversation_id}.`
+            );
+          }
+          const context = await fsp.readFile(item.resolved_context_path, "utf8");
+          const deliveredContext = redactSensitiveText(context);
+          const chunks = splitTextBlocks(deliveredContext);
+          const bytes = Buffer.byteLength(deliveredContext, "utf8");
+          const sha256 = createHash("sha256")
+            .update(deliveredContext, "utf8")
+            .digest("hex");
+          return { item, chunks, bytes, sha256 };
+        })
+      );
+
+      const blocks: string[] = [
+        [
+          "# Complete ChatGPT context delivery",
+          "",
+          `Resolved ${result.resolved}/${result.count} ChatGPT conversation${result.count === 1 ? "" : "s"}.`,
+          "Every declared context block is returned in this same MCP tool result. No pagination or follow-up read is required for normal reading.",
+          ""
+        ].join("\n")
+      ];
+
+      for (const delivery of deliveries) {
+        const { item, chunks, bytes, sha256 } = delivery;
+        blocks.push(
+          [
+            `# Delivery manifest · ${item.source_url}`,
+            "",
+            `- Status: \`${item.status}\``,
+            `- Context blocks: ${chunks.length}`,
+            `- UTF-8 bytes: ${bytes}`,
+            `- SHA-256: \`${sha256}\``,
+            `- Local events: ${item.counts.local_events}`,
+            `- Web-visible messages: ${item.counts.web_messages}`,
+            `- Matched: ${item.counts.matched}`,
+            `- TUI-only: ${item.counts.local_only}`,
+            `- Web-only: ${item.counts.web_only}`,
+            `- Branch points: ${item.counts.branch_points}`,
+            ""
+          ].join("\n")
+        );
+        chunks.forEach((chunk, index) => {
+          blocks.push(
+            [
+              `# CONTEXT BLOCK ${index + 1}/${chunks.length} · ${item.conversation_id}`,
+              "",
+              chunk
+            ].join("\n")
+          );
+        });
+        blocks.push(
+          [
+            `# DELIVERY COMPLETE · ${item.conversation_id}`,
+            "",
+            `- Received blocks: ${chunks.length}/${chunks.length}`,
+            `- UTF-8 bytes: ${bytes}`,
+            `- SHA-256: \`${sha256}\``,
+            "- This receipt belongs to the complete reconciled context returned above."
+          ].join("\n")
+        );
+      }
+
+      if (failures.length) {
+        blocks.push(
+          [
+            "# Resolution failures",
+            "",
+            ...failures.map(
+              (item) => `- ${item.source_url}: ${item.error ?? "unavailable"}`
+            )
+          ].join("\n")
+        );
+      }
+
+      return textBlocksResult(blocks, {
+        ...result,
+        deliveries: deliveries.map(({ item, chunks, bytes, sha256 }) => ({
+          conversation_id: item.conversation_id,
+          blocks: chunks.length,
+          bytes,
+          sha256,
+          complete: true
+        }))
+      });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "read_chatgpt_context",
+    {
+      title: "Read ChatGPT Context",
+      description:
+        "Diagnostic/random-access reader for a previously reconciled ChatGPT context by private URL/ID without depending on the current workspace. Normal requests to read a chat should use resolve_chatgpt_context, which returns the complete context atomically and does not require pagination.",
+      inputSchema: {
+        chat: z.string().min(1).describe("Private https://chatgpt.com/c/<id> URL or conversation UUID."),
+        start_line: z.number().int().min(1).optional().describe("1-based line to start reading. Default: 1."),
+        max_lines: z.number().int().min(1).max(2000).optional().describe("Maximum lines to return. Default: 400.")
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true },
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Reading reconciled ChatGPT context...",
+        "openai/toolInvocation/invoked": "ChatGPT context read"
+      }
+    },
+    async (args) => {
+      const page = await readResolvedChatGPTContext({
+        chat: args.chat,
+        startLine: args.start_line,
+        maxLines: args.max_lines
+      });
+      const text = [
+        `# Reconciled ChatGPT context · lines ${page.start_line}-${page.end_line} of ${page.total_lines}`,
+        "",
+        page.text,
+        page.next_start_line
+          ? `[Continue with start_line=${page.next_start_line}.]`
+          : "[End of resolved context.]"
+      ].join("\n");
+      return textResult(text, { ...page });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
     "export_chatgpt_chats",
     {
       title: "Export ChatGPT Chats",
       description:
-        "Export one or more private ChatGPT conversation URLs/IDs to canonical local Markdown through chatgpt-exporter/CWA. Use this when the user provides ChatGPT chat links as context; it preserves visible alternative branches and returns absolute local file paths.",
+        "Export one or more private ChatGPT conversation URLs/IDs to canonical local Markdown through chatgpt-exporter/CWA. This is the canonical-web-only view and preserves visible alternative branches. For ordinary requests to read or continue a supplied ChatGPT chat, prefer resolve_chatgpt_context so local gptty observations are reconciled instead of discarded.",
       inputSchema: {
         chats: z.array(z.string().min(1)).min(1).max(20).describe("Private https://chatgpt.com/c/<id> URLs or conversation UUIDs to export.")
       },
